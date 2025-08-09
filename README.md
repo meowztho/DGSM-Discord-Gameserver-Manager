@@ -139,14 +139,87 @@ Some servers require SteamCMD to install or update.
 
 ---
 
-## 💖 Support this project
+🛠 Configuration File Reference
+
+DGSM stores its settings in JSON files. These files are created automatically on first run, but you can also edit them manually.
+
+1. server_config.json
+
+Defines all game servers managed by DGSM.
+
+{
+  "servers": [
+    {
+      "name": "Palworld",
+      "steam_app_id": 2394010,
+      "executable": "PalServer.exe",
+      "parameters": [
+        "-useperfthreads", "-UseMultithreadForDS",
+        "-RCONEnabled=True", "-RCONPort=25575",
+        "-AdminPassword=CHANGE_ME"
+      ]
+    }
+  ],
+  "auto_update": true,
+  "auto_restart": true,
+  "stop_time": "02:09",
+  "restart_after_stop": true
+}
+
+Fields:
+
+name: Server display name in Discord
+
+steam_app_id: Steam App ID for this game
+
+executable: The server .exe file name
+
+parameters: List of startup parameters
+
+auto_update: If true, updates before start
+
+auto_restart: If true, restarts at stop_time
+
+stop_time: Time for daily stop/restart (HH:MM)
+
+restart_after_stop: If true, restarts automatically after stop
+
+2. plugin_templates/
+
+Contains templates for supported games. Templates define the default configuration for a new server of that game.
+Example (plugin_templates/Palworld/server_settings.json):
+
+{
+  "world_name": "MyPalworld",
+  "max_players": 16,
+  "password": "",
+  "difficulty": "Normal"
+}
+
+These values are used when DGSM installs a new server instance.
+
+3. server_settings.json (per server)
+
+Each server folder (under steam/) can have its own server_settings.json. These override the defaults from the template.
+
+Notes:
+
+Always keep a backup before manual editing
+
+JSON must be valid – check syntax with a JSON validator
+
+After changes, restart the bot for them to take effect
+
+💖 Support this project
 
 If DGSM saves you time or helps you run your servers, please consider supporting development:
 
-* **[GitHub Sponsors](https://github.com/sponsors/meowztho)**
+GitHub Sponsors
 
----
+Ko-fi
 
-## 📜 License
+📜 License
+
+MIT – see LICENSE for details.
 
 MIT – see [LICENSE](LICENSE) for details.
