@@ -21,3 +21,8 @@ Perfect as an alternative to WindowsGSM when you want everything inside Discord.
 2. Clone the repo and install dependencies:
    ```bash
    pip install -r requirements.txt
+   
+## 💖 Support this project
+If DGSM saves you time or helps you run your servers, please consider supporting its development:
+
+- [GitHub Sponsors](https://github.com/sponsors/meowztho)
