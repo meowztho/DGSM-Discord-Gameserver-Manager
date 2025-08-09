@@ -1,0 +1,24 @@
+{
+    "log_retention_days": 7,
+    "health_check_interval": 5,
+    "force_recover_on_start": true,
+    "check_ports": true,
+    "server_paths": {
+        "Palworld Port 8211": {
+            "app_id": "2394010",
+            "executable": "PalServer.exe"
+        },
+        "Satisfactory Port 7777": {
+            "app_id": "526870",
+            "executable": "FactoryServer.exe"
+        },
+        "Core Keeper Port 9000": {
+            "app_id": "1963720",
+            "executable": "CoreKeeperServer.exe"
+        },
+        "Enshrouded Port 15637": {
+            "app_id": "2278520",
+            "executable": "enshrouded_server.exe"
+        }
+    }
+}
