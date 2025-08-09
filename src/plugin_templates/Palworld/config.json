@@ -1,0 +1,23 @@
+{
+    "app_id": "2394010",
+    "executable": "PalServer.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:02",
+    "restart_after_stop": false,
+    "parameters": [
+        "-EpicApp=PalServer",
+        "-useperfthreads",
+        "-UseMultithreadForDS",
+        "-NumberOfWorkerThreadsServer=15",
+        "-EnableHighPrecisionPhysics",
+        "-EnableNavmeshPriorityThreads",
+        "-UseAsyncLoadingThread",
+        "-UseBackgroundLevelStreaming",
+        "-norendering",
+        "RCONEnabled=True",
+        "-RCONPort=25575",
+        "-AdminPassword=1234",
+        "USEALLAVAILABLECORES"
+    ]
+}
