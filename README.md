@@ -203,7 +203,6 @@ Each server folder (under `steam/`) can have its own `server_settings.json`. The
 
 - Always keep a backup before manual editing
 - JSON must be valid – check syntax with a JSON validator
-- After changes, restart the bot for them to take effect
 
 ---
 
