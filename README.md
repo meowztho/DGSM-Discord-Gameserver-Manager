@@ -1,6 +1,6 @@
 # DGSM – Discord Gameserver Manager (MIT)
 
-Manage and automate your game servers directly from Discord – no remote desktop required.
+Manage and automate your game servers directly from Discord.
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
 
 ![Main Bot UI](docs/images/bot_ui.png)
@@ -14,7 +14,8 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 * Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
 * Role & permission checks for admin actions
 * SQLite logging, JSON configuration
-* Runs on Windows servers without RDP
+* **First run setup**: Automatically creates `.env`, `server_config.json` and default templates if missing
+* After Setup runs on Windows servers without RDP
 
 ---
 
@@ -40,50 +41,27 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
    pip install -r requirements.txt
    ```
 
-4. **Configure `.env`**
-   Copy `.env.example` to `.env` and fill in your details:
-
-   ```
-   DISCORD_TOKEN=YOUR_BOT_TOKEN
-   ADMIN_CHANNEL_ID=123456789012345678
-   ```
-
-5. **Configure servers**
-   Edit `server_config.json` to include your servers.
-   Example:
-
-   ```json
-   {
-     "servers": [
-       {
-         "name": "Palworld",
-         "steam_app_id": 2394010,
-         "executable": "PalServer.exe",
-         "parameters": [
-           "-useperfthreads", "-UseMultithreadForDS",
-           "-RCONEnabled=True", "-RCONPort=25575",
-           "-AdminPassword=CHANGE_ME"
-         ]
-       }
-     ],
-     "auto_update": true,
-     "auto_restart": true,
-     "stop_time": "02:09",
-     "restart_after_stop": true
-   }
-   ```
-
-6. **Run the bot**
+4. **First run setup**
+   Simply start the bot:
 
    ```bash
    python -m src.Main
    ```
 
+   On the first run, DGSM will:
+
+   * Create `.env` (with placeholder values) if it does not exist
+
+   You only need to edit these files afterwards to:
+
+   * Change your Discord bot token and admin channel ID in `.env`
+   * Adjust `server_config.json` and templates for special settings your servers
+
 ---
 
 ## ⚙️ Discord Bot Setup
 
-Before running DGSM, you must create a bot account in the Discord Developer Portal.
+Before running DGSM with a real token, you must create a bot account in the Discord Developer Portal.
 
 1. **Go to the Developer Portal**
    [https://discord.com/developers/applications](https://discord.com/developers/applications)
@@ -133,7 +111,7 @@ Before running DGSM, you must create a bot account in the Discord Developer Port
 | -------------------------------------- | -------------------------------------------- |
 | ![Main Menu](docs/images/bot_main.png) | ![Server Status](docs/images/bot_status.png) |
 
-*(You can add more screenshots and GIFs here to showcase the bot in action.)*
+
 
 ---
 
@@ -159,7 +137,6 @@ Some servers require SteamCMD to install or update.
 If DGSM saves you time or helps you run your servers, please consider supporting development:
 
 * **[GitHub Sponsors](https://github.com/sponsors/meowztho)**
-* **[Ko-fi](https://ko-fi.com/your-kofi-username)**
 
 ---
 
