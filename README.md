@@ -103,6 +103,13 @@ Before running DGSM with a real token, you must create a bot account in the Disc
      * `Use Slash Commands`
    * Copy the generated URL → open in browser → Authorize bot for your server.
 
+6. **Create required roles**  
+   - In your Discord server settings, go to **Roles** and create:
+     - **Admin** – for full bot control and all admin commands
+     - **Player** – for basic usage such as viewing status, starting servers (if allowed)
+   - Assign these roles to users accordingly.  
+     The bot checks these roles to determine what commands a user can run.
+
 ---
 
 ## 📷 Screenshots
