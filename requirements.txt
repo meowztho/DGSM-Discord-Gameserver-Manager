@@ -1,0 +1,6 @@
+py-cord==2.6.1
+python-dotenv
+cryptography
+psutil
+pydantic
+pre-commit
