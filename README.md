@@ -112,10 +112,10 @@ Before running DGSM with a real token, you must create a bot account in the Disc
 
 ## 📷 Screenshots
 
-| ![Main Menu](docs/bot_ui.png) | ![Server Status](docs/bot_status.png)                 |
- ![Server Status](docs/slashcommand.png) | ![Server Status](docs/full.png) |
-
-*(You can add more screenshots and GIFs here to showcase the bot in action.)*
+| Main Menu | Server Status |
+| --------- | ------------- |
+|![Main Menu](docs/bot_ui.png)|![Server Status](docs/bot_status.png)|
+|![Server Status](docs/slashcommand.png)|![Server Status](docs/full.png)|
 
 ---
 
