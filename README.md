@@ -1,6 +1,6 @@
 # DGSM – Discord Gameserver Manager (MIT)
 
-Manage and automate your game servers directly from Discord – no remote desktop required.  
+Manage and automate your game servers directly from Discord – no remote desktop required.
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
 
 ![Main Bot UI](docs/images/bot_ui.png)
@@ -8,134 +8,161 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 ---
 
 ## ✨ Features
-- Start / Stop / Restart / Status via buttons and slash commands
-- Optional auto-update and scheduled restart
-- Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
-- Role & permission checks for admin actions
-- SQLite logging, JSON configuration
-- Runs on Windows servers without RDP
+
+* Start / Stop / Restart / Status via buttons and slash commands
+* Optional auto-update and scheduled restart
+* Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
+* Role & permission checks for admin actions
+* SQLite logging, JSON configuration
+* Runs on Windows servers without RDP
 
 ---
 
 ## 📦 Installation
 
-1. **Install Python 3.12**  
-   [https://www.python.org/downloads/](https://www.python.org/downloads/)  
+1. **Install Python 3.12**
+   [https://www.python.org/downloads/](https://www.python.org/downloads/)
    Make sure to check **"Add Python to PATH"** during installation.
 
-2. **Download DGSM**  
-   - Click the green **Code** button → **Download ZIP**  
-   - Or clone:
+2. **Download DGSM**
+
+   * Click the green **Code** button → **Download ZIP**
+   * Or clone:
+
      ```bash
      git clone https://github.com/meowztho/DGSM-Discord-Gameserver-Manager.git
      cd DGSM-Discord-Gameserver-Manager
      ```
 
-3. **Install dependencies**  
+3. **Install dependencies**
+
    ```bash
    pip install -r requirements.txt
+   ```
 
-4. **Configure .env**
-   Copy .env.example to .env and fill in your details:
+4. **Configure `.env`**
+   Copy `.env.example` to `.env` and fill in your details:
+
+   ```
    DISCORD_TOKEN=YOUR_BOT_TOKEN
    ADMIN_CHANNEL_ID=123456789012345678
-   
+   ```
+
 5. **Configure servers**
-Edit server_config.json to include your servers.
-Example:
+   Edit `server_config.json` to include your servers.
+   Example:
 
-{
-  "servers": [
-    {
-      "name": "Palworld",
-      "steam_app_id": 2394010,
-      "executable": "PalServer.exe",
-      "parameters": [
-        "-useperfthreads", "-UseMultithreadForDS",
-        "-RCONEnabled=True", "-RCONPort=25575",
-        "-AdminPassword=CHANGE_ME"
-      ]
-    }
-  ],
-  "auto_update": true,
-  "auto_restart": true,
-  "stop_time": "02:09",
-  "restart_after_stop": true
-}
+   ```json
+   {
+     "servers": [
+       {
+         "name": "Palworld",
+         "steam_app_id": 2394010,
+         "executable": "PalServer.exe",
+         "parameters": [
+           "-useperfthreads", "-UseMultithreadForDS",
+           "-RCONEnabled=True", "-RCONPort=25575",
+           "-AdminPassword=CHANGE_ME"
+         ]
+       }
+     ],
+     "auto_update": true,
+     "auto_restart": true,
+     "stop_time": "02:09",
+     "restart_after_stop": true
+   }
+   ```
 
-6.Run the bot
+6. **Run the bot**
+
+   ```bash
    python -m src.Main
+   ```
 
-⚙️ Discord Bot Setup
+---
+
+## ⚙️ Discord Bot Setup
+
 Before running DGSM, you must create a bot account in the Discord Developer Portal.
 
-Go to the Developer Portal
-https://discord.com/developers/applications
+1. **Go to the Developer Portal**
+   [https://discord.com/developers/applications](https://discord.com/developers/applications)
 
-Create a new application
+2. **Create a new application**
 
-Click New Application
+   * Click **New Application**
+   * Name it (e.g., `DGSM Server Manager`)
 
-Name it (e.g., DGSM Server Manager)
+3. **Add a Bot User**
 
-Add a Bot User
+   * Go to **Bot** in the left menu
+   * Click **Add Bot** → **Yes, do it!**
+   * Enable these intents:
 
-Go to Bot in the left menu
+     * `PRESENCE INTENT`
+     * `SERVER MEMBERS INTENT`
+     * `MESSAGE CONTENT INTENT`
+   * Reset token and copy it for `.env`
 
-Click Add Bot → Yes, do it!
+4. **Set Admin Channel ID**
 
-Enable these intents:
+   * In Discord, enable **Developer Mode** (Settings → Advanced)
+   * Right-click your admin channel → **Copy Channel ID**
+   * Add to `.env`
 
-PRESENCE INTENT
+5. **Invite the bot to your server**
 
-SERVER MEMBERS INTENT
+   * Go to **OAuth2 → URL Generator**
+   * Under **SCOPES**, check:
 
-MESSAGE CONTENT INTENT
+     * `bot`
+     * `applications.commands`
+   * Under **BOT PERMISSIONS**, check:
 
-Reset token and copy it for .env
+     * `Send Messages`
+     * `Embed Links`
+     * `Read Message History`
+     * `Use Slash Commands`
+   * Copy the generated URL → open in browser → Authorize bot for your server.
 
-Set Admin Channel ID
+---
 
-In Discord, enable Developer Mode (Settings → Advanced)
+## 📷 Screenshots
 
-Right-click your admin channel → Copy Channel ID
+| Main Menu                              | Server Status                                |
+| -------------------------------------- | -------------------------------------------- |
+| ![Main Menu](docs/images/bot_main.png) | ![Server Status](docs/images/bot_status.png) |
 
-Add to .env
+*(You can add more screenshots and GIFs here to showcase the bot in action.)*
 
-Invite the bot to your server
+---
 
-Go to OAuth2 → URL Generator
+## 📥 SteamCMD Setup
 
-Under SCOPES, check:
-
-bot
-
-applications.commands
-
-Under BOT PERMISSIONS, check:
-
-Send Messages
-
-Embed Links
-
-Read Message History
-
-Use Slash Commands
-
-Copy the generated URL → open in browser → Authorize bot for your server.
-
-📷 Screenshots
-
-📥 SteamCMD Setup
 Some servers require SteamCMD to install or update.
 
 1. Download from Valve:
-https://developer.valvesoftware.com/wiki/SteamCMD
+   [https://developer.valvesoftware.com/wiki/SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
 
-Extract to a folder,
+2. Extract to a folder, e.g.:
 
-src/steam
+   ```
+   src/steam
+   ```
 
-💖 Support this project
+   or anywhere else (update path in your config).
+
+---
+
+## 💖 Support this project
+
 If DGSM saves you time or helps you run your servers, please consider supporting development:
-https://github.com/sponsors/meowztho
+
+* **[GitHub Sponsors](https://github.com/sponsors/meowztho)**
+* **[Ko-fi](https://ko-fi.com/your-kofi-username)**
+
+---
+
+## 📜 License
+
+MIT – see [LICENSE](LICENSE) for details.
