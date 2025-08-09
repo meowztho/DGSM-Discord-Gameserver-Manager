@@ -3,7 +3,7 @@
 Manage and automate your game servers directly from Discord.
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
 
-![Main Bot UI](docs/images/bot_ui.png)
+![Main Bot UI](docs/bot_ui.png)
 
 ---
 
