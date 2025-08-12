@@ -15,7 +15,7 @@ from paths import SERVER_PATHS, SERVER_CONFIGS, load_server_paths, load_server_c
 from config_store import get_config_value
 from db import write_action_log
 from pidcache import save_pids, load_pids
-from steam_integration import run_update  # <-- neu: für Auto-Update
+from steam_integration import run_update  # für Auto-Update
 
 # Per-Server-Locks gegen Doppelstart/-stop
 server_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -35,12 +35,6 @@ def _normalize_params(p) -> List[str]:
 
 
 def _resolve_executable(server_name: str) -> Optional[str]:
-    """
-    Finde die ausführbare Datei:
-    1) server_settings.json -> "executable"
-    2) server_config.json   -> "executable"
-    3) Glob-Suche im serverfiles-Ordner (z. B. *Server*.exe)
-    """
     base = SERVER_PATHS.get(server_name)
     if not base:
         return None
@@ -64,12 +58,10 @@ def _resolve_executable(server_name: str) -> Optional[str]:
     patterns = ["*Server*.exe", "*Dedicated*.exe", "*.exe"]
     for pat in patterns:
         hits = glob.glob(os.path.join(base, pat))
-        # bevorzuge Dateien mit 'Server' im Namen
         hits.sort(key=lambda p: (("server" not in p.lower()), len(p)))
         for h in hits:
             if os.path.isfile(h):
                 return h
-
     return None
 
 
@@ -77,17 +69,14 @@ def _server_command(server_name: str) -> Optional[List[str]]:
     base = SERVER_PATHS.get(server_name)
     if not base:
         return None
-
     exe_path = _resolve_executable(server_name)
     if not exe_path:
         return None
-
     params = _normalize_params(SERVER_CONFIGS.get(server_name, {}).get("parameters", []))
     return [exe_path] + params
 
 
 async def start_server(server_name: str) -> bool:
-    # immer frisch laden
     load_server_paths()
     load_server_configs()
 
@@ -97,18 +86,13 @@ async def start_server(server_name: str) -> bool:
             logging.error(f"[START] Pfad für {server_name} nicht gefunden.")
             return False
 
-        # Wenn schon läuft, nicht doppelt starten
         if server_name in server_processes and server_processes[server_name].is_running():
-            logging.info(f"[START] {server_name} läuft bereits (PID {server_processes[server_name].pid}).")
+            logging.info(f"[START] {server_name} läuft bereits.")
             return True
 
         cmd = _server_command(server_name)
         if not cmd:
-            detail = (
-                f"Exe nicht gefunden. Basis: {SERVER_PATHS.get(server_name)} | "
-                f"config.executable={get_config_value(server_name, 'executable')} | "
-                f"settings.executable={SERVER_CONFIGS.get(server_name, {}).get('executable')}"
-            )
+            detail = f"Exe nicht gefunden in {SERVER_PATHS.get(server_name)}"
             write_action_log("start", server_name, "failed", detail)
             logging.error(f"[START] {server_name}: {detail}")
             return False
@@ -121,7 +105,7 @@ async def start_server(server_name: str) -> bool:
             )
             server_processes[server_name] = psutil.Process(proc.pid)
             save_pids(server_processes)
-            write_action_log("start", server_name, "success", f"PID {proc.pid} | CMD: {' '.join(cmd)}")
+            write_action_log("start", server_name, "success", f"PID {proc.pid}")
             logging.info(f"[START] {server_name} gestartet. PID {proc.pid}")
             return True
         except Exception as e:
@@ -170,28 +154,37 @@ async def recover_running_servers():
             else:
                 write_action_log("recovery", name, "failed", f"Ungültiger Prozess {pid}")
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            write_action_log("recovery", name, "failed", f"Prozess nicht gefunden: {e}")
+            write_action_log("recovery", name, "failed", str(e))
+
+
+async def auto_update_if_enabled(server_name: str):
+    cfg = SERVER_CONFIGS.get(server_name, {})
+    if cfg.get("auto_update", False):
+        ok, msg = await run_update(server_name)
+        write_action_log("auto_update", server_name, "success" if ok else "failed", msg or "")
+        logging.info(f"[AUTO-UPDATE] {server_name}: {'OK' if ok else 'FAIL'} | {msg}")
+
+
+async def startup_auto_update():
+    """Beim Bot-Startup für alle Server mit auto_update=True einmal ausführen."""
+    load_server_paths()
+    load_server_configs()
+    for name in SERVER_PATHS.keys():
+        cfg = SERVER_CONFIGS.get(name, {})
+        if cfg.get("auto_update", False):
+            await auto_update_if_enabled(name)
 
 
 async def monitor_servers():
-    """
-    - Crash-Watch (auto_restart)
-    - Täglicher Stop um 'stop_time'
-    - NEU: Auto-Update direkt NACH dem täglichen Stop, wenn auto_update=True
-            und NUR wenn der Server nicht läuft.
-    - Optionaler Neustart gemäß restart_after_stop
-    """
     last_reload = 0
     loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(30)
 
-        # Config-Reload alle 5 Minuten
         if (loop.time() - last_reload) > 300:
             load_server_configs()
             last_reload = loop.time()
 
-        # Crash watch / Auto-Restart
         for name in list(server_processes.keys()):
             try:
                 if not server_processes[name].is_running():
@@ -202,7 +195,6 @@ async def monitor_servers():
             except Exception:
                 server_processes.pop(name, None)
 
-        # Tägliche Wartung: Stop + Auto-Update (falls gewünscht) + optionaler Restart
         now = datetime.now().strftime("%H:%M")
         for name in list(SERVER_PATHS.keys()):
             cfg = SERVER_CONFIGS.get(name, {})
@@ -210,25 +202,17 @@ async def monitor_servers():
             if not st:
                 continue
 
-            # genau zur Stopzeit einmal pro Tag stoppen
             if now == st and name not in daily_stopped_servers:
-                # 1) Stoppen, falls läuft
                 if name in server_processes:
                     await stop_server(name)
                 daily_stopped_servers.add(name)
 
-                # 2) Auto-Update: nur wenn aktiviert und Server jetzt wirklich aus
-                if cfg.get("auto_update", True) and name not in server_processes:
-                    ok, msg = await run_update(name)
-                    write_action_log("auto_update", name, "success" if ok else "failed", msg if msg else "")
-                    logging.info(f"[AUTO-UPDATE] {name}: {'OK' if ok else 'FAIL'} | {msg}")
+                await auto_update_if_enabled(name)
 
-                # 3) Optional wieder starten
                 if cfg.get("restart_after_stop", False):
                     await asyncio.sleep(60)
                     await start_server(name)
 
-            # um Mitternacht Reset der Tagesmarkierung
             if now == "00:00":
                 daily_stopped_servers.discard(name)
 
