@@ -1,4 +1,4 @@
-# DGSM – Discord Gameserver Manager (MIT)
+# DGSM – Discord Gameserver Manager
 
 Manage and automate your game servers directly from Discord – no remote desktop required.\
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
