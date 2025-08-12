@@ -15,6 +15,7 @@ from paths import SERVER_PATHS, SERVER_CONFIGS, load_server_paths, load_server_c
 from config_store import get_config_value
 from db import write_action_log
 from pidcache import save_pids, load_pids
+from steam_integration import run_update  # <-- neu: für Auto-Update
 
 # Per-Server-Locks gegen Doppelstart/-stop
 server_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -173,14 +174,24 @@ async def recover_running_servers():
 
 
 async def monitor_servers():
+    """
+    - Crash-Watch (auto_restart)
+    - Täglicher Stop um 'stop_time'
+    - NEU: Auto-Update direkt NACH dem täglichen Stop, wenn auto_update=True
+            und NUR wenn der Server nicht läuft.
+    - Optionaler Neustart gemäß restart_after_stop
+    """
     last_reload = 0
     loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(30)
+
+        # Config-Reload alle 5 Minuten
         if (loop.time() - last_reload) > 300:
             load_server_configs()
             last_reload = loop.time()
-        # crash watch
+
+        # Crash watch / Auto-Restart
         for name in list(server_processes.keys()):
             try:
                 if not server_processes[name].is_running():
@@ -190,20 +201,34 @@ async def monitor_servers():
                         await start_server(name)
             except Exception:
                 server_processes.pop(name, None)
-        # scheduled stops
+
+        # Tägliche Wartung: Stop + Auto-Update (falls gewünscht) + optionaler Restart
         now = datetime.now().strftime("%H:%M")
         for name in list(SERVER_PATHS.keys()):
             cfg = SERVER_CONFIGS.get(name, {})
             st = cfg.get("stop_time")
             if not st:
                 continue
+
+            # genau zur Stopzeit einmal pro Tag stoppen
             if now == st and name not in daily_stopped_servers:
+                # 1) Stoppen, falls läuft
                 if name in server_processes:
                     await stop_server(name)
-                    daily_stopped_servers.add(name)
-                    if cfg.get("restart_after_stop", False):
-                        await asyncio.sleep(60)
-                        await start_server(name)
+                daily_stopped_servers.add(name)
+
+                # 2) Auto-Update: nur wenn aktiviert und Server jetzt wirklich aus
+                if cfg.get("auto_update", True) and name not in server_processes:
+                    ok, msg = await run_update(name)
+                    write_action_log("auto_update", name, "success" if ok else "failed", msg if msg else "")
+                    logging.info(f"[AUTO-UPDATE] {name}: {'OK' if ok else 'FAIL'} | {msg}")
+
+                # 3) Optional wieder starten
+                if cfg.get("restart_after_stop", False):
+                    await asyncio.sleep(60)
+                    await start_server(name)
+
+            # um Mitternacht Reset der Tagesmarkierung
             if now == "00:00":
                 daily_stopped_servers.discard(name)
 
