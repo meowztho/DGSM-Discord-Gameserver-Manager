@@ -5,7 +5,7 @@ import signal
 import sys
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable
 import glob
 from collections import defaultdict
 
@@ -39,7 +39,7 @@ def _resolve_executable(server_name: str) -> Optional[str]:
     if not base:
         return None
 
-    # 1) settings
+    # 1) settings.json
     settings = SERVER_CONFIGS.get(server_name, {})
     exe_settings = settings.get("executable")
     if exe_settings:
@@ -47,7 +47,7 @@ def _resolve_executable(server_name: str) -> Optional[str]:
         if os.path.isfile(candidate):
             return candidate
 
-    # 2) config
+    # 2) server_config.json
     exe_config = get_config_value(server_name, "executable")
     if exe_config:
         candidate = os.path.join(base, exe_config)
@@ -76,7 +76,17 @@ def _server_command(server_name: str) -> Optional[List[str]]:
     return [exe_path] + params
 
 
+async def auto_update_if_enabled(server_name: str):
+    """Update ausführen, wenn auto_update: true."""
+    cfg = SERVER_CONFIGS.get(server_name, {})
+    if cfg.get("auto_update", False):
+        ok, msg = await run_update(server_name)
+        write_action_log("auto_update", server_name, "success" if ok else "failed", msg or "")
+        logging.info(f"[AUTO-UPDATE] {server_name}: {'OK' if ok else 'FAIL'} | {msg}")
+
+
 async def start_server(server_name: str) -> bool:
+    """Startet den Server, macht vorher ein Update wenn auto_update aktiviert ist."""
     load_server_paths()
     load_server_configs()
 
@@ -86,9 +96,13 @@ async def start_server(server_name: str) -> bool:
             logging.error(f"[START] Pfad für {server_name} nicht gefunden.")
             return False
 
+        # Läuft schon?
         if server_name in server_processes and server_processes[server_name].is_running():
             logging.info(f"[START] {server_name} läuft bereits.")
             return True
+
+        # Erst Update, wenn aktiviert
+        await auto_update_if_enabled(server_name)
 
         cmd = _server_command(server_name)
         if not cmd:
@@ -114,35 +128,189 @@ async def start_server(server_name: str) -> bool:
             return False
 
 
+# -----------------------------
+#       STOP ‑ HELFER
+# -----------------------------
+def _list_server_related_processes(server_path: str) -> List[psutil.Process]:
+    """
+    Sucht alle Prozesse, die sehr wahrscheinlich zu diesem Server gehören:
+    - exe() liegt unter server_path
+    - oder cwd() liegt unter server_path
+    """
+    related: List[psutil.Process] = []
+    server_path = os.path.normcase(os.path.abspath(server_path))
+    for p in psutil.process_iter(attrs=["pid", "exe", "cwd"]):
+        try:
+            exe = p.info.get("exe") or ""
+            cwd = p.info.get("cwd") or ""
+            if exe:
+                exe_norm = os.path.normcase(os.path.abspath(exe))
+                if exe_norm.startswith(server_path):
+                    related.append(psutil.Process(p.info["pid"]))
+                    continue
+            if cwd:
+                cwd_norm = os.path.normcase(os.path.abspath(cwd))
+                if cwd_norm.startswith(server_path):
+                    related.append(psutil.Process(p.info["pid"]))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+    # Doppelte PIDs entfernen
+    by_pid = {p.pid: p for p in related}
+    return list(by_pid.values())
+
+
+async def _wait_gone(proc: psutil.Process, timeout: float) -> bool:
+    try:
+        await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=timeout)
+        return True
+    except (asyncio.TimeoutError, psutil.NoSuchProcess):
+        return not proc.is_running()
+    except Exception:
+        return False
+
+
+async def _win_taskkill(pid: int, force: bool) -> None:
+    """taskkill auf Windows, mit/ohne /F, immer /T für Kindprozesse."""
+    args = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        args.append("/F")
+    subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def _terminate_tree_windows(pids: Iterable[int]) -> None:
+    """Killt eine Menge PIDs inkl. Kindprozesse auf Windows, erst weich dann hart."""
+    for pid in list(set(pids)):
+        await _win_taskkill(pid, force=False)
+    await asyncio.sleep(1)
+    for pid in list(set(pids)):
+        await _win_taskkill(pid, force=True)
+
+
+# -----------------------------
+#            STOP
+# -----------------------------
 async def stop_server(server_name: str) -> bool:
     async with server_locks[server_name]:
-        if server_name not in server_processes:
+        base = SERVER_PATHS.get(server_name)
+        if not base:
             return False
-        proc = server_processes.pop(server_name)
+
+        # 1) Primär: unser getrackter Hauptprozess
+        proc = server_processes.get(server_name)
+
+        # 2) Zusätzlich: alle Prozesse, die im Serverordner laufen (falls Wrapper/Entkopplung)
+        related = _list_server_related_processes(base)
+
+        # Wenn gar nichts bekannt/gefunden: nichts zu stoppen
+        if proc is None and not related:
+            return False
+
+        killed = False
+
         try:
-            if sys.platform == "win32":
+            # --- Versuche zuerst den Hauptprozess sauber zu stoppen ---
+            if proc:
                 try:
-                    proc.send_signal(signal.CTRL_BREAK_EVENT)
-                    await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=10)
-                except (asyncio.TimeoutError, psutil.NoSuchProcess):
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], check=False)
-            else:
+                    proc = psutil.Process(proc.pid)  # refresh
+                except psutil.NoSuchProcess:
+                    proc = None
+
+            if proc and sys.platform == "win32":
+                # CTRL_BREAK NUR für eigene Kinder
+                is_child = (proc.ppid() == os.getpid())
+                if is_child:
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        if await _wait_gone(proc, timeout=10):
+                            killed = True
+                    except (psutil.NoSuchProcess, OSError):
+                        pass
+
+                if not killed:
+                    # sanft
+                    try:
+                        proc.terminate()
+                        if await _wait_gone(proc, timeout=8):
+                            killed = True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                if not killed:
+                    # taskkill-Baum für den Hauptprozess
+                    await _terminate_tree_windows([proc.pid])
+
+            elif proc and sys.platform != "win32":
                 try:
                     proc.terminate()
-                    await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=10)
-                except (asyncio.TimeoutError, psutil.NoSuchProcess):
+                    if await _wait_gone(proc, timeout=10):
+                        killed = True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                if not killed:
                     os.system(f"pkill -TERM -P {proc.pid}")
+                    if await _wait_gone(proc, timeout=5):
+                        killed = True
+                if not killed:
+                    proc.kill()
+                    await _wait_gone(proc, timeout=5)
+
+            # --- Jetzt alle übrigen „verlorenen“ Prozesse im Serverordner killen ---
+            if sys.platform == "win32":
+                await _terminate_tree_windows([p.pid for p in related])
+            else:
+                for p in related:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.0)
+                # zur Sicherheit hart
+                for p in related:
+                    try:
+                        if p.is_running():
+                            p.kill()
+                    except Exception:
+                        pass
+
+            # --- Verifikation: lebt noch irgendwas im Serverordner? ---
+            still = _list_server_related_processes(base)
+            if proc:
+                try:
+                    if proc.is_running():
+                        still.append(proc)
+                except Exception:
+                    pass
+
+            if still:
+                # Nichts entfernt! -> STOP fehlgeschlagen
+                write_action_log("stop", server_name, "failed", f"{len(still)} Prozesse übrig")
+                logging.warning(f"[STOP] {server_name}: {len(still)} Prozesse laufen noch.")
+                return False
+
+            # Erfolg
+            server_processes.pop(server_name, None)
             save_pids(server_processes)
             write_action_log("stop", server_name, "success")
             logging.info(f"[STOP] {server_name} gestoppt.")
             return True
+
         except Exception as e:
+            # Letzter Versuch auf Windows: Full force
+            if sys.platform == "win32":
+                try:
+                    if proc:
+                        await _win_taskkill(proc.pid, force=True)
+                except Exception:
+                    pass
             write_action_log("stop", server_name, "failed", str(e))
             logging.exception(f"[STOP] Fehler beim Stop von {server_name}")
             return False
 
 
 async def recover_running_servers():
+    """Lädt PIDs aus Cache und übernimmt laufende Server in den Prozess-Tracker."""
     load_server_paths()
     pids = load_pids()
     for name, pid in pids.items():
@@ -154,37 +322,28 @@ async def recover_running_servers():
             else:
                 write_action_log("recovery", name, "failed", f"Ungültiger Prozess {pid}")
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            write_action_log("recovery", name, "failed", str(e))
-
-
-async def auto_update_if_enabled(server_name: str):
-    cfg = SERVER_CONFIGS.get(server_name, {})
-    if cfg.get("auto_update", False):
-        ok, msg = await run_update(server_name)
-        write_action_log("auto_update", server_name, "success" if ok else "failed", msg or "")
-        logging.info(f"[AUTO-UPDATE] {server_name}: {'OK' if ok else 'FAIL'} | {msg}")
-
-
-async def startup_auto_update():
-    """Beim Bot-Startup für alle Server mit auto_update=True einmal ausführen."""
-    load_server_paths()
-    load_server_configs()
-    for name in SERVER_PATHS.keys():
-        cfg = SERVER_CONFIGS.get(name, {})
-        if cfg.get("auto_update", False):
-            await auto_update_if_enabled(name)
+            # AccessDenied kann nach Neustarts vorkommen – dann kein Adoptieren
+            write_action_log("recovery", name, "failed", f"Prozess nicht übernommen: {e}")
 
 
 async def monitor_servers():
+    """
+    - Crash-Watch (auto_restart)
+    - Auto-Stop zu stop_time
+    - Beim Auto-Stop: Update (wenn auto_update) + Restart (wenn restart_after_stop)
+    """
     last_reload = 0
     loop = asyncio.get_event_loop()
+
     while True:
         await asyncio.sleep(30)
 
+        # Config-Reload alle 5 Minuten
         if (loop.time() - last_reload) > 300:
             load_server_configs()
             last_reload = loop.time()
 
+        # Crash-Watch
         for name in list(server_processes.keys()):
             try:
                 if not server_processes[name].is_running():
@@ -195,6 +354,7 @@ async def monitor_servers():
             except Exception:
                 server_processes.pop(name, None)
 
+        # Auto-Stop + Auto-Update
         now = datetime.now().strftime("%H:%M")
         for name in list(SERVER_PATHS.keys()):
             cfg = SERVER_CONFIGS.get(name, {})
@@ -218,6 +378,7 @@ async def monitor_servers():
 
 
 async def graceful_stop_all():
+    """Stoppt alle Server beim Beenden des Bots."""
     for name in list(server_processes.keys()):
         try:
             await stop_server(name)
