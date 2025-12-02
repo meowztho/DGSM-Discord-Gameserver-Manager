@@ -1,0 +1,14 @@
+{
+    "app_id": "1963720",
+    "executable": "CoreKeeperServer.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+        "-batchmode",
+        "-nographics",
+        "-norendering",
+        "-activatecontent GiantCicadaBossDungeon,NatureBiomeCicadas,GuaranteedOases,AbioticFactor"
+    ]
+}
