@@ -1,0 +1,12 @@
+{
+    "app_id": "2278520",
+    "executable": "enshrouded_server.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [],
+    "created_at": "2025-08-04 23:00:12",
+    "username": "SteamUser",
+    "password": "SteamPw"
+}
