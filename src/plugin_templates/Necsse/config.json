@@ -1,0 +1,23 @@
+{
+    "app_id": "1169040",
+    "executable": "jre\\bin\\java.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+		"-XX:+UnlockExperimentalVMOptions",
+        "-XX:+UseG1GC",
+        "-XX:+ExplicitGCInvokesConcurrent",
+        "-XX:G1NewSizePercent=20",
+        "-XX:G1ReservePercent=20",
+        "-XX:MaxGCPauseMillis=50",
+        "-XX:G1HeapRegionSize=32M",
+        "-jar",
+        "Server.jar",
+        "-nogui",
+        "-world",
+        "Survival2025",
+        "-pausewhenempty"
+		]
+}
