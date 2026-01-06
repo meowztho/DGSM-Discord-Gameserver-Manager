@@ -1,6 +1,6 @@
 {
     "app_id": "3809400",
-    "executable": "StarRuptureServerEOS-Win64-Shipping.exe",
+    "executable": "StarRuptureServerEOS.exe",
     "auto_update": false,
     "auto_restart": true,
     "stop_time": "05:00",
@@ -9,4 +9,5 @@
         "-log",
         "-port=7777"
     ]
+
 }
