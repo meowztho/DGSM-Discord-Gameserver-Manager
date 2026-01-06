@@ -1,0 +1,11 @@
+{
+    "executable": "StarRuptureServerEOS-Win64-Shipping.exe",
+    "parameters": [
+        "-log",
+        "-port=7777"
+    ],
+    "auto_update": false,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false
+}
