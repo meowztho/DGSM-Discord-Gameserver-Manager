@@ -1,5 +1,8 @@
 # DGSM – Discord Gameserver Manager
 
+![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
+
+
 Manage and automate your game servers directly from Discord – no remote desktop required.\
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
 
