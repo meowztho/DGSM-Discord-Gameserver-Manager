@@ -211,7 +211,7 @@ Each server folder (under `steam/`) can have its own `server_settings.json`. The
 If DGSM saves you time or helps you run your servers, please consider supporting development:
 
 - [**GitHub Sponsors**](https://github.com/sponsors/meowztho)
-- [**Patreon**](patreon.com/meowztho)
+- [**Paypal**](paypal.me/farrnbacher)
 
 ---
 
