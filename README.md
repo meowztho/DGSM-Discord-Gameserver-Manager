@@ -13,11 +13,14 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 ## ✨ Features
 
 - Start / Stop / Restart / Status via buttons and slash commands
+- Create ZIP backups via `/createbackup`
+- Restore server data from ZIP backups via `/restorebackup`
+- Live operation states in UI (start/stop/update/backup/restore)
 - Optional auto-update and scheduled restart
 - Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
 - Role & permission checks for admin actions
 - SQLite logging, JSON configuration
-- **First run setup**: Automatically creates `.env`, `server_config.json` and default templates if missing
+- **First run setup**: guided prompt for required `.env` values
 - Runs on Windows servers without RDP
 
 ---
@@ -47,19 +50,25 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
    Simply start the bot:
 
    ```bash
-   python -m src.Main
+   # from repository root
+   python src/Main.py
+
+   # or from inside src/
+   python Main.py
    ```
 
-   On the first run, DGSM will:
+   On first run, DGSM will:
 
-   - Create `.env` (with placeholder values) if it does not exist
-   - Create `server_config.json` with an example Palworld server
-   - Create the `templates/` folder with default template files
+   - Prompt for missing required values (`DISCORD_TOKEN`, channels, domain)
+   - Encrypt sensitive values in `src/.env`
+   - Load server entries from `src/server_config.json` (if present)
 
-   You only need to edit these files afterwards to:
+   After setup:
 
-   - Add your Discord bot token and admin channel ID in `.env`
-   - Adjust `server_config.json` and templates for your servers
+   - Manage templates in `src/plugin_templates/`
+   - Add servers via `/addserver` (recommended) or directly in `src/server_config.json`
+   - For a second server with the same template/app, set `instance_id` in `/addserver` (optional)
+   - Backups are stored in `src/steam/backup`
 
 ---
 
@@ -129,83 +138,81 @@ Some servers require SteamCMD to install or update.
 1. Download from Valve:\
    [https://developer.valvesoftware.com/wiki/SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
 
-2. Extract to a folder, e.g.:
+2. DGSM supports these SteamCMD locations:
 
-   ```
-   src/steam
-   ```
+   - `steam/steamcmd.exe` relative to `Main.py` directory (this is `src/steam/steamcmd.exe` when started from repo root)
+   - Path from env variable `STEAMCMD_PATH`
+   - Any SteamCMD available in your system `PATH`
 
-   or anywhere else (update path in your config).
+3. Optional: set `STEAMCMD_PATH` in `src/.env`, for example:
+
+   ```env
+   STEAMCMD_PATH=C:\\Tools\\SteamCMD\\steamcmd.exe
+   ```
 
 ---
 
-## 🛠 Configuration File Reference
+## 💾 Backup & Restore
 
-DGSM stores its settings in JSON files. These files are created automatically on first run, but you can also edit them manually.
+DGSM supports Discord-driven backups and restores.
 
-### 1. `server_config.json`
+- Default backup folder: `src/steam/backup`
+- Create backup: `/createbackup name:<server>`
+- Restore backup: `/restorebackup name:<server> backup_file:<file.zip> overwrite:<true|false>`
+- Backup selection supports files from `src/steam/backup` (and legacy `src/backups` if present)
+- Bot responses show short backup paths like `/steam/backup/<file>.zip` (no full absolute path)
+- UI updates automatically after backup/restore and does not stay stuck on "Backup running"
 
-Defines all game servers managed by DGSM.
+---
+
+## Configuration File Reference
+
+DGSM reads and writes its runtime config in `src/server_config.json`.
+
+### 1. `src/server_config.json`
 
 ```json
 {
-  "servers": [
-    {
-      "name": "Palworld",
-      "steam_app_id": 2394010,
+  "log_retention_days": 7,
+  "server_paths": {
+    "Palworld-main": {
+      "app_id": "2394010",
       "executable": "PalServer.exe",
-      "parameters": [
-        "-useperfthreads", "-UseMultithreadForDS",
-        "-RCONEnabled=True", "-RCONPort=25575",
-        "-AdminPassword=CHANGE_ME"
-      ]
+      "instance_id": "Palworld-main",
+      "username": "steam_user_optional",
+      "password": "gAAAA...encrypted..."
     }
-  ],
-  "auto_update": true,
-  "auto_restart": true,
-  "stop_time": "02:09",
-  "restart_after_stop": true
+  }
 }
 ```
 
-**Fields:**
+Fields used by the bot:
 
-- `name`: Server display name in Discord
-- `steam_app_id`: Steam App ID for this game
-- `executable`: The server `.exe` file name
-- `parameters`: List of startup parameters
-- `auto_update`: If `true`, updates before start
-- `auto_restart`: If `true`, restarts at `stop_time`
-- `stop_time`: Time for daily stop/restart (`HH:MM`)
-- `restart_after_stop`: If `true`, restarts automatically after stop
+- `log_retention_days`: retention for action logs in SQLite.
+- `server_paths.<name>.app_id`: required Steam AppID.
+- `server_paths.<name>.executable`: optional executable file name.
+- `server_paths.<name>.instance_id`: optional instance folder key. `/addserver` can set this explicitly, otherwise it is generated automatically.
+- `server_paths.<name>.install_dir`: optional custom serverfiles path (absolute or relative to `src/`).
+- `server_paths.<name>.username` / `password`: optional Steam login. Password is encrypted in config.
 
----
+### 2. `src/plugin_templates/<TemplateName>/`
 
-### 2. `plugin_templates/`
+Each template folder normally contains:
 
-Contains templates for supported games. Templates define the default configuration for a new server of that game. Example (`plugin_templates/Palworld/server_settings.json`):
+- `config.json`: install/update metadata like `app_id`, `executable`, update flags and optional Steam credentials.
+- `server_settings.json`: copied into the server instance and used for runtime options.
 
-```json
-{
-  "world_name": "MyPalworld",
-  "max_players": 16,
-  "password": "",
-  "difficulty": "Normal"
-}
-```
+### 3. `server_settings.json` per server instance
 
-These values are used when DGSM installs a new server instance.
+Typical locations:
 
----
+- Legacy layout: `src/steam/GSM/servers/<app_id>/serverfiles/server_settings.json`
+- Instance layout: `src/steam/GSM/servers/<app_id>/instances/<instance_id>/serverfiles/server_settings.json`
 
-### 3. `server_settings.json` (per server)
+Notes:
 
-Each server folder (under `steam/`) can have its own `server_settings.json`. These override the defaults from the template.
-
-**Notes:**
-
-- Always keep a backup before manual editing
-- JSON must be valid – check syntax with a JSON validator
+- Keep backups before manual edits.
+- JSON must be valid.
 
 ---
 
