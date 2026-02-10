@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import os
 import signal
@@ -15,6 +15,7 @@ from paths import SERVER_PATHS, SERVER_CONFIGS, load_server_paths, load_server_c
 from config_store import get_config_value
 from db import write_action_log
 from pidcache import save_pids, load_pids
+from runtime_status import begin_operation, end_operation_success, end_operation_failed
 from steam_integration import run_update  # für Auto-Update
 
 # Per-Server-Locks gegen Doppelstart/-stop
@@ -32,6 +33,15 @@ def _normalize_params(p) -> List[str]:
     if isinstance(p, str):
         return [s for s in p.split() if s]
     return [str(p)]
+
+
+def _is_within_path(base_dir: str, candidate: str) -> bool:
+    try:
+        base_abs = os.path.normcase(os.path.abspath(base_dir))
+        cand_abs = os.path.normcase(os.path.abspath(candidate))
+        return os.path.commonpath([base_abs, cand_abs]) == base_abs
+    except Exception:
+        return False
 
 
 def _resolve_executable(server_name: str) -> Optional[str]:
@@ -87,49 +97,60 @@ async def auto_update_if_enabled(server_name: str):
 
 async def start_server(server_name: str) -> bool:
     """Startet den Server, macht vorher ein Update wenn auto_update aktiviert ist."""
-    load_server_paths()
-    load_server_configs()
+    success = False
+    fail_reason = ""
+    begin_operation(server_name, "start")
+    try:
+        load_server_paths()
+        load_server_configs()
 
-    async with server_locks[server_name]:
-        if server_name not in SERVER_PATHS:
-            write_action_log("start", server_name, "failed", "path not found")
-            logging.error(f"[START] Pfad für {server_name} nicht gefunden.")
-            return False
+        async with server_locks[server_name]:
+            if server_name not in SERVER_PATHS:
+                fail_reason = "path not found"
+                write_action_log("start", server_name, "failed", fail_reason)
+                logging.error(f"[START] Pfad für {server_name} nicht gefunden.")
+                return False
 
-        # Läuft schon?
-        if server_name in server_processes and server_processes[server_name].is_running():
-            logging.info(f"[START] {server_name} läuft bereits.")
-            return True
+            # Läuft schon?
+            if server_name in server_processes and server_processes[server_name].is_running():
+                logging.info(f"[START] {server_name} läuft bereits.")
+                success = True
+                return True
 
-        # Erst Update, wenn aktiviert
-        await auto_update_if_enabled(server_name)
+            # Erst Update, wenn aktiviert
+            await auto_update_if_enabled(server_name)
 
-        cmd = _server_command(server_name)
-        if not cmd:
-            detail = f"Exe nicht gefunden in {SERVER_PATHS.get(server_name)}"
-            write_action_log("start", server_name, "failed", detail)
-            logging.error(f"[START] {server_name}: {detail}")
-            return False
+            cmd = _server_command(server_name)
+            if not cmd:
+                fail_reason = f"Exe nicht gefunden in {SERVER_PATHS.get(server_name)}"
+                write_action_log("start", server_name, "failed", fail_reason)
+                logging.error(f"[START] {server_name}: {fail_reason}")
+                return False
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=SERVER_PATHS[server_name],
-                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0),
-            )
-            server_processes[server_name] = psutil.Process(proc.pid)
-            save_pids(server_processes)
-            write_action_log("start", server_name, "success", f"PID {proc.pid}")
-            logging.info(f"[START] {server_name} gestartet. PID {proc.pid}")
-            return True
-        except Exception as e:
-            write_action_log("start", server_name, "failed", str(e))
-            logging.exception(f"[START] Fehler beim Start von {server_name}")
-            return False
-
-
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=SERVER_PATHS[server_name],
+                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0),
+                )
+                server_processes[server_name] = psutil.Process(proc.pid)
+                save_pids(server_processes)
+                write_action_log("start", server_name, "success", f"PID {proc.pid}")
+                logging.info(f"[START] {server_name} gestartet. PID {proc.pid}")
+                success = True
+                return True
+            except Exception as e:
+                fail_reason = str(e)
+                write_action_log("start", server_name, "failed", fail_reason)
+                logging.exception(f"[START] Fehler beim Start von {server_name}")
+                return False
+    finally:
+        if success:
+            end_operation_success(server_name)
+        else:
+            end_operation_failed(server_name, fail_reason or "Start fehlgeschlagen")
 # -----------------------------
-#       STOP ‑ HELFER
+#       STOP - HELFER
 # -----------------------------
 def _list_server_related_processes(server_path: str) -> List[psutil.Process]:
     """
@@ -144,13 +165,11 @@ def _list_server_related_processes(server_path: str) -> List[psutil.Process]:
             exe = p.info.get("exe") or ""
             cwd = p.info.get("cwd") or ""
             if exe:
-                exe_norm = os.path.normcase(os.path.abspath(exe))
-                if exe_norm.startswith(server_path):
+                if _is_within_path(server_path, exe):
                     related.append(psutil.Process(p.info["pid"]))
                     continue
             if cwd:
-                cwd_norm = os.path.normcase(os.path.abspath(cwd))
-                if cwd_norm.startswith(server_path):
+                if _is_within_path(server_path, cwd):
                     related.append(psutil.Process(p.info["pid"]))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -192,122 +211,135 @@ async def _terminate_tree_windows(pids: Iterable[int]) -> None:
 #            STOP
 # -----------------------------
 async def stop_server(server_name: str) -> bool:
-    async with server_locks[server_name]:
-        base = SERVER_PATHS.get(server_name)
-        if not base:
-            return False
+    success = False
+    fail_reason = ""
+    begin_operation(server_name, "stop")
+    try:
+        async with server_locks[server_name]:
+            base = SERVER_PATHS.get(server_name)
+            if not base:
+                fail_reason = "path not found"
+                return False
 
-        # 1) Primär: unser getrackter Hauptprozess
-        proc = server_processes.get(server_name)
+            # 1) Primär: unser getrackter Hauptprozess
+            proc = server_processes.get(server_name)
 
-        # 2) Zusätzlich: alle Prozesse, die im Serverordner laufen (falls Wrapper/Entkopplung)
-        related = _list_server_related_processes(base)
+            # 2) Zusätzlich: alle Prozesse, die im Serverordner laufen (falls Wrapper/Entkopplung)
+            related = _list_server_related_processes(base)
 
-        # Wenn gar nichts bekannt/gefunden: nichts zu stoppen
-        if proc is None and not related:
-            return False
+            # Wenn gar nichts bekannt/gefunden: nichts zu stoppen
+            if proc is None and not related:
+                fail_reason = "keine Prozesse gefunden"
+                return False
 
-        killed = False
+            killed = False
 
-        try:
-            # --- Versuche zuerst den Hauptprozess sauber zu stoppen ---
-            if proc:
-                try:
-                    proc = psutil.Process(proc.pid)  # refresh
-                except psutil.NoSuchProcess:
-                    proc = None
-
-            if proc and sys.platform == "win32":
-                # CTRL_BREAK NUR für eigene Kinder
-                is_child = (proc.ppid() == os.getpid())
-                if is_child:
+            try:
+                # --- Versuche zuerst den Hauptprozess sauber zu stoppen ---
+                if proc:
                     try:
-                        proc.send_signal(signal.CTRL_BREAK_EVENT)
-                        if await _wait_gone(proc, timeout=10):
-                            killed = True
-                    except (psutil.NoSuchProcess, OSError):
-                        pass
+                        proc = psutil.Process(proc.pid)  # refresh
+                    except psutil.NoSuchProcess:
+                        proc = None
 
-                if not killed:
-                    # sanft
+                if proc and sys.platform == "win32":
+                    # CTRL_BREAK NUR für eigene Kinder
+                    is_child = (proc.ppid() == os.getpid())
+                    if is_child:
+                        try:
+                            proc.send_signal(signal.CTRL_BREAK_EVENT)
+                            if await _wait_gone(proc, timeout=10):
+                                killed = True
+                        except (psutil.NoSuchProcess, OSError):
+                            pass
+
+                    if not killed:
+                        # sanft
+                        try:
+                            proc.terminate()
+                            if await _wait_gone(proc, timeout=8):
+                                killed = True
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+
+                    if not killed:
+                        # taskkill-Baum für den Hauptprozess
+                        await _terminate_tree_windows([proc.pid])
+
+                elif proc and sys.platform != "win32":
                     try:
                         proc.terminate()
-                        if await _wait_gone(proc, timeout=8):
+                        if await _wait_gone(proc, timeout=10):
                             killed = True
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
+                    if not killed:
+                        os.system(f"pkill -TERM -P {proc.pid}")
+                        if await _wait_gone(proc, timeout=5):
+                            killed = True
+                    if not killed:
+                        proc.kill()
+                        await _wait_gone(proc, timeout=5)
 
-                if not killed:
-                    # taskkill-Baum für den Hauptprozess
-                    await _terminate_tree_windows([proc.pid])
+                # --- Jetzt alle übrigen "verlorenen" Prozesse im Serverordner killen ---
+                if sys.platform == "win32":
+                    await _terminate_tree_windows([p.pid for p in related])
+                else:
+                    for p in related:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1.0)
+                    # zur Sicherheit hart
+                    for p in related:
+                        try:
+                            if p.is_running():
+                                p.kill()
+                        except Exception:
+                            pass
 
-            elif proc and sys.platform != "win32":
-                try:
-                    proc.terminate()
-                    if await _wait_gone(proc, timeout=10):
-                        killed = True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-                if not killed:
-                    os.system(f"pkill -TERM -P {proc.pid}")
-                    if await _wait_gone(proc, timeout=5):
-                        killed = True
-                if not killed:
-                    proc.kill()
-                    await _wait_gone(proc, timeout=5)
-
-            # --- Jetzt alle übrigen „verlorenen“ Prozesse im Serverordner killen ---
-            if sys.platform == "win32":
-                await _terminate_tree_windows([p.pid for p in related])
-            else:
-                for p in related:
+                # --- Verifikation: lebt noch irgendwas im Serverordner? ---
+                still = _list_server_related_processes(base)
+                if proc:
                     try:
-                        p.terminate()
-                    except Exception:
-                        pass
-                await asyncio.sleep(1.0)
-                # zur Sicherheit hart
-                for p in related:
-                    try:
-                        if p.is_running():
-                            p.kill()
+                        if proc.is_running():
+                            still.append(proc)
                     except Exception:
                         pass
 
-            # --- Verifikation: lebt noch irgendwas im Serverordner? ---
-            still = _list_server_related_processes(base)
-            if proc:
-                try:
-                    if proc.is_running():
-                        still.append(proc)
-                except Exception:
-                    pass
+                if still:
+                    # Nichts entfernt! -> STOP fehlgeschlagen
+                    fail_reason = f"{len(still)} Prozesse übrig"
+                    write_action_log("stop", server_name, "failed", fail_reason)
+                    logging.warning(f"[STOP] {server_name}: {len(still)} Prozesse laufen noch.")
+                    return False
 
-            if still:
-                # Nichts entfernt! -> STOP fehlgeschlagen
-                write_action_log("stop", server_name, "failed", f"{len(still)} Prozesse übrig")
-                logging.warning(f"[STOP] {server_name}: {len(still)} Prozesse laufen noch.")
+                # Erfolg
+                server_processes.pop(server_name, None)
+                save_pids(server_processes)
+                write_action_log("stop", server_name, "success")
+                logging.info(f"[STOP] {server_name} gestoppt.")
+                success = True
+                return True
+
+            except Exception as e:
+                # Letzter Versuch auf Windows: Full force
+                if sys.platform == "win32":
+                    try:
+                        if proc:
+                            await _win_taskkill(proc.pid, force=True)
+                    except Exception:
+                        pass
+                fail_reason = str(e)
+                write_action_log("stop", server_name, "failed", fail_reason)
+                logging.exception(f"[STOP] Fehler beim Stop von {server_name}")
                 return False
-
-            # Erfolg
-            server_processes.pop(server_name, None)
-            save_pids(server_processes)
-            write_action_log("stop", server_name, "success")
-            logging.info(f"[STOP] {server_name} gestoppt.")
-            return True
-
-        except Exception as e:
-            # Letzter Versuch auf Windows: Full force
-            if sys.platform == "win32":
-                try:
-                    if proc:
-                        await _win_taskkill(proc.pid, force=True)
-                except Exception:
-                    pass
-            write_action_log("stop", server_name, "failed", str(e))
-            logging.exception(f"[STOP] Fehler beim Stop von {server_name}")
-            return False
-
+    finally:
+        if success:
+            end_operation_success(server_name)
+        else:
+            end_operation_failed(server_name, fail_reason or "Stop fehlgeschlagen")
 
 async def recover_running_servers():
     """Lädt PIDs aus Cache und übernimmt laufende Server in den Prozess-Tracker."""
@@ -322,7 +354,7 @@ async def recover_running_servers():
             else:
                 write_action_log("recovery", name, "failed", f"Ungültiger Prozess {pid}")
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            # AccessDenied kann nach Neustarts vorkommen – dann kein Adoptieren
+            # AccessDenied kann nach Neustarts vorkommen - dann kein Adoptieren
             write_action_log("recovery", name, "failed", f"Prozess nicht übernommen: {e}")
 
 
@@ -384,3 +416,4 @@ async def graceful_stop_all():
             await stop_server(name)
         except Exception:
             pass
+

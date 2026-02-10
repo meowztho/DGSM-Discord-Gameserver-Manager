@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import discord
 
 from context import user_has_permission
@@ -6,6 +6,7 @@ from paths import SERVER_PATHS, load_server_paths, load_server_configs
 from server_manager import server_processes, start_server, stop_server
 from db import write_action_log
 from config_store import get_config_value
+from runtime_status import get_operation_status
 
 
 # ---------- robust interaction helpers ----------
@@ -31,6 +32,11 @@ async def safe_inter_send(inter: discord.Interaction, content: str, *, ephemeral
     except discord.NotFound:
         # Fallback: normaler Channel-Post (nicht-ephemeral möglich)
         try:
+            if ephemeral:
+                logging.warning("safe_inter_send fallback: ephemeral content suppressed in public channel.")
+                return await inter.channel.send(
+                    "Antwort konnte nicht privat zugestellt werden. Bitte Aktion erneut ausführen."
+                )
             return await inter.channel.send(content)
         except Exception as e:
             logging.error(f"safe_inter_send fallback failed: {e}")
@@ -46,6 +52,28 @@ async def clean_channel(channel):
 
 
 async def get_server_status(name: str) -> str:
+    state, detail = get_operation_status(name)
+    if state == "busy":
+        label = (detail or "").strip().lower()
+        if label == "update":
+            return "🟡 Update läuft"
+        if label == "backup":
+            return "🟡 Backup läuft"
+        if label == "start":
+            return "🟡 Start läuft"
+        if label == "stop":
+            return "🟡 Stopp läuft"
+        if label == "restore":
+            return "🟡 Restore läuft"
+        return "🟡 Aktiv"
+    if state == "failed":
+        msg = " ".join((detail or "").split())
+        if msg:
+            if len(msg) > 72:
+                msg = msg[:72].rstrip() + "..."
+            return f"🔴 Fehler: {msg}"
+        return "🔴 Fehler"
+
     try:
         proc = server_processes.get(name)
         if proc and proc.is_running():
@@ -139,21 +167,24 @@ class ServerControlView(discord.ui.View):
             cnt += 1
             if get_config_value(n, "app_id"):
                 if cnt >= 5:
-                    row += 1; cnt = 0
+                    row += 1
+                    cnt = 0
                 self.add_item(UpdateButton(n, row=row, disabled=not self.access))
                 cnt += 1
             if cnt >= 5:
-                row += 1; cnt = 0
+                row += 1
+                cnt = 0
 
 
 # ---------- status message ----------
 async def update_status_message(channel, ip_address, user=None):
-    load_server_paths(); load_server_configs()
+    load_server_paths()
+    load_server_configs()
 
     embed = discord.Embed(title="⚙️ Server Management", color=0x3498db)
     from context import DOMAIN
     embed.add_field(name="🌐 IP", value=f"{ip_address}\n ({DOMAIN})", inline=False)
-    embed.add_field(name="ℹ Hinweis", value="Buttons nur für Admin/Player", inline=False)
+    embed.add_field(name="ℹ️ Hinweis", value="Buttons nur für Admin/Player", inline=False)
 
     status_lines = []
     for n in SERVER_PATHS:

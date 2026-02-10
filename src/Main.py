@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import signal
 from datetime import time
@@ -12,6 +12,9 @@ from server_manager import recover_running_servers, monitor_servers
 from discord.ext import tasks
 from ui import clean_channel, update_status_message
 from server_manager import graceful_stop_all
+
+
+_monitor_task = None
 
 
 @tasks.loop(time=time(hour=6, minute=0))
@@ -28,18 +31,21 @@ async def daily_update():
 
 @bot.event
 async def on_ready():
+    global _monitor_task
     try:
         init_db()
         cleanup_old_logs(get_log_retention_days())
         load_server_paths()
         load_server_configs()
         await recover_running_servers()
-        asyncio.create_task(monitor_servers())
+        if _monitor_task is None or _monitor_task.done():
+            _monitor_task = asyncio.create_task(monitor_servers())
         ch = bot.get_channel(CHANNEL)
         if ch:
             await clean_channel(ch)
             await update_status_message(ch, safe_get_ip(), user=None)
-        daily_update.start()
+        if not daily_update.is_running():
+            daily_update.start()
         write_action_log("bot_start", "system", "success")
         logging.info(f"{bot.user} ist online!")
     except Exception as e:
