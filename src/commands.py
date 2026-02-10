@@ -1,8 +1,10 @@
-import os
+﻿import os
 import json
 import shlex
 import logging
 import asyncio
+import zipfile
+from datetime import datetime
 from typing import Optional, List
 
 import discord
@@ -12,14 +14,28 @@ from discord.ext import commands
 
 from context import bot
 from security import encrypt_value
-from config_store import save_config, load_config, PLUGIN_TEMPLATES_DIR
+from config_store import (
+    save_config,
+    load_config,
+    PLUGIN_TEMPLATES_DIR,
+    BASE_DIR,
+    CONFIG_PATH,
+    DB_PATH,
+)
 from config_store import get_config_value
-from paths import load_server_paths, load_server_configs, SERVER_PATHS
+from paths import (
+    load_server_paths,
+    load_server_configs,
+    SERVER_PATHS,
+    server_root,
+    sanitize_instance_id,
+)
 from db import write_action_log
 from ui import update_status_message, clean_channel
 from server_manager import start_server, stop_server, server_processes
-from steam_integration import run_update, run_update_with_credentials
+from steam_integration import run_update, run_update_with_credentials, get_steamcmd_resolution
 from context import CHANNEL, safe_get_ip
+from runtime_status import begin_operation, end_operation_success, end_operation_failed, clear_server_status
 
 
 # ---------- helper: robust defer & reply ----------
@@ -55,11 +71,127 @@ async def safe_send(ctx: discord.ApplicationContext, content: Optional[str] = No
         # Interaction-Token ungültig → Fallback auf normalen Channel-Post
         ch = ctx.channel
         if ch:
+            if ephemeral:
+                logging.warning("safe_send fallback: ephemeral content suppressed in public channel.")
+                return await ch.send("Antwort konnte nicht privat zugestellt werden. Bitte Befehl erneut ausführen.")
             return await ch.send(content or "", embed=embed)
         raise
     except Exception as e:
         logging.exception(f"safe_send failed: {e}")
         raise
+
+
+def _make_instance_id(cfg: dict, app_id: str, preferred: str) -> str:
+    base = sanitize_instance_id(preferred)
+    used = set()
+    for entry in cfg.get("server_paths", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("app_id")) != str(app_id):
+            continue
+        iid = entry.get("instance_id")
+        if isinstance(iid, str) and iid.strip():
+            used.add(sanitize_instance_id(iid))
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}-{n}" in used:
+        n += 1
+    return f"{base}-{n}"
+
+
+def _instance_id_exists(cfg: dict, app_id: str, instance_id: str) -> bool:
+    wanted = sanitize_instance_id(instance_id)
+    for entry in cfg.get("server_paths", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("app_id")) != str(app_id):
+            continue
+        existing = entry.get("instance_id")
+        if isinstance(existing, str) and sanitize_instance_id(existing) == wanted:
+            return True
+    return False
+
+
+def _delete_root_from_server_path(path: str) -> str:
+    p = os.path.abspath(path)
+    if os.path.basename(p).lower() == "serverfiles":
+        return os.path.dirname(p)
+    return p
+
+
+def _create_directory_backup(path: str, server_name: str) -> str:
+    import shutil
+
+    backup_dir = _backup_dir()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_base = os.path.join(backup_dir, f"{sanitize_instance_id(server_name)}-{stamp}")
+    return shutil.make_archive(backup_base, "zip", root_dir=path)
+
+
+def _backup_dir() -> str:
+    backup_dir = os.path.join(BASE_DIR, "steam", "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    return backup_dir
+
+
+def _legacy_backup_dir() -> str:
+    return os.path.join(BASE_DIR, "backups")
+
+
+def _backup_search_dirs() -> List[str]:
+    dirs = [_backup_dir()]
+    legacy = _legacy_backup_dir()
+    if os.path.isdir(legacy):
+        dirs.append(legacy)
+    return dirs
+
+
+def _backup_display_path(path: str) -> str:
+    filename = os.path.basename(path)
+    full = os.path.abspath(path)
+    try:
+        primary = os.path.abspath(_backup_dir())
+        if os.path.commonpath([primary, full]) == primary:
+            return f"/steam/backup/{filename}"
+    except Exception:
+        pass
+    try:
+        legacy = os.path.abspath(_legacy_backup_dir())
+        if os.path.commonpath([legacy, full]) == legacy:
+            return f"/backups/{filename}"
+    except Exception:
+        pass
+    return filename
+
+
+def _resolve_backup_path(backup_file: str) -> Optional[str]:
+    backup_name = os.path.basename(str(backup_file or "").strip())
+    if not backup_name:
+        return None
+    for backup_dir in _backup_search_dirs():
+        candidate = os.path.abspath(os.path.join(backup_dir, backup_name))
+        backup_root = os.path.abspath(backup_dir)
+        try:
+            if os.path.commonpath([backup_root, candidate]) != backup_root:
+                continue
+        except Exception:
+            continue
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _zip_members_are_safe(zip_ref: zipfile.ZipFile, target_dir: str) -> bool:
+    target_root = os.path.abspath(target_dir)
+    for member in zip_ref.namelist():
+        target_path = os.path.abspath(os.path.join(target_dir, member))
+        try:
+            if os.path.commonpath([target_root, target_path]) != target_root:
+                return False
+        except Exception:
+            return False
+    return True
 
 
 # --------------- autocomplete ---------------
@@ -77,6 +209,32 @@ async def server_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionCh
     return [OptionChoice(s) for s in cfg["server_paths"].keys() if ctx.value.lower() in s.lower()]
 
 
+async def backup_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoice]:
+    try:
+        current = (ctx.value or "").lower()
+        server_name = sanitize_instance_id(str(ctx.options.get("name", "") or "")).lower()
+        files = []
+        seen = set()
+        for backup_dir in _backup_search_dirs():
+            for entry in os.listdir(backup_dir):
+                full = os.path.join(backup_dir, entry)
+                key = entry.lower()
+                if key in seen:
+                    continue
+                if os.path.isfile(full) and key.endswith(".zip"):
+                    seen.add(key)
+                    files.append(entry)
+        files.sort(reverse=True)
+        if server_name:
+            matching = [f for f in files if server_name in f.lower()]
+            non_matching = [f for f in files if server_name not in f.lower()]
+            files = matching + non_matching
+        return [OptionChoice(f) for f in files if current in f.lower()][:25]
+    except Exception as e:
+        logging.error(f"Backup Autocomplete error: {e}")
+        return []
+
+
 async def section_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoice]:
     return [OptionChoice("config"), OptionChoice("settings")]
 
@@ -87,7 +245,18 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
     section = ctx.options.get("section")
     if not name or not section:
         return []
-    all_config_keys = ["app_id", "executable", "username", "password", "auto_update", "auto_restart", "stop_time", "restart_after_stop"]
+    all_config_keys = [
+        "app_id",
+        "executable",
+        "username",
+        "password",
+        "instance_id",
+        "install_dir",
+        "auto_update",
+        "auto_restart",
+        "stop_time",
+        "restart_after_stop",
+    ]
     all_settings_keys = ["executable", "parameters", "auto_update", "auto_restart", "stop_time", "restart_after_stop"]
     try:
         if section == "config":
@@ -115,6 +284,57 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
 
 
 # --------------- commands ---------------
+@bot.slash_command(name="diag", description="Zeigt eine kurze Systemdiagnose für DGSM")
+@commands.has_role("Admin")
+@commands.cooldown(2, 10, commands.BucketType.user)
+async def diag(ctx: discord.ApplicationContext):
+    await safe_defer(ctx, ephemeral=True)
+    try:
+        cfg = load_config()
+        load_server_paths()
+        load_server_configs()
+        steamcmd_path, steam_dir = get_steamcmd_resolution()
+
+        server_lines = []
+        running_count = 0
+        for name, path in SERVER_PATHS.items():
+            path_ok = os.path.isdir(path)
+            settings_ok = os.path.isfile(os.path.join(path, "server_settings.json"))
+            running = False
+            try:
+                proc = server_processes.get(name)
+                running = bool(proc and proc.is_running())
+            except Exception:
+                running = False
+            if running:
+                running_count += 1
+            server_lines.append(
+                f"- `{name}` | path:{'ok' if path_ok else 'missing'} | "
+                f"settings:{'ok' if settings_ok else 'missing'} | running:{'yes' if running else 'no'}"
+            )
+
+        max_lines = 20
+        details = "\n".join(server_lines[:max_lines]) if server_lines else "- Keine Server eingetragen"
+        if len(server_lines) > max_lines:
+            details += f"\n- ... {len(server_lines) - max_lines} weitere"
+
+        message = (
+            "**DGSM Diagnose**\n"
+            f"- Config: `{CONFIG_PATH}`\n"
+            f"- Logs DB: `{DB_PATH}`\n"
+            f"- SteamCMD: `{steamcmd_path or 'nicht gefunden'}`\n"
+            f"- Steam Verzeichnis: `{steam_dir}`\n"
+            f"- Domain-IP Lookup: `{safe_get_ip()}`\n"
+            f"- Server eingetragen: `{len(cfg.get('server_paths', {}))}`\n"
+            f"- Server laufend: `{running_count}`\n\n"
+            f"**Serverstatus**\n{details}"
+        )
+        await safe_send(ctx, message, ephemeral=True)
+    except Exception:
+        logging.exception("diag failed")
+        await safe_send(ctx, "Diagnose fehlgeschlagen. Details stehen im Bot-Log.", ephemeral=True)
+
+
 @bot.slash_command(name="createtemplate", description="Erstellt oder aktualisiert ein Server-Template")
 @commands.has_role("Admin")
 @commands.cooldown(1, 5, commands.BucketType.user)
@@ -171,6 +391,7 @@ async def add_server(
     ctx: discord.ApplicationContext,
     name: str,
     template: Option(str, "Vorlage für den Server", autocomplete=template_autocomplete),
+    instance_id: Option(str, "Optionale Instanz-ID (z.B. pve-2)", required=False),
 ):
     await safe_defer(ctx, ephemeral=True)
     try:
@@ -186,10 +407,26 @@ async def add_server(
             if req not in tcfg:
                 return await safe_send(ctx, f"❌ Template unvollständig. Fehlend: {req}", ephemeral=True)
 
-        app_id = tcfg["app_id"]
+        cfg = load_config()
+        if name in cfg["server_paths"]:
+            return await safe_send(ctx, f"Server '{name}' existiert bereits.", ephemeral=True)
+
+        app_id = str(tcfg["app_id"])
         executable = tcfg["executable"]
-        server_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "steam", "GSM", "servers", str(app_id))
-        server_dir = os.path.join(server_root, "serverfiles")
+        if instance_id:
+            chosen_instance_id = sanitize_instance_id(instance_id)
+            if _instance_id_exists(cfg, app_id, chosen_instance_id):
+                return await safe_send(
+                    ctx,
+                    f"Instanz-ID '{chosen_instance_id}' ist für App-ID {app_id} bereits vergeben.",
+                    ephemeral=True,
+                )
+        else:
+            chosen_instance_id = _make_instance_id(cfg, app_id, name)
+
+        instance_id = chosen_instance_id
+        instance_root = server_root(app_id, instance_id=instance_id)
+        server_dir = os.path.join(str(instance_root), "serverfiles")
         os.makedirs(server_dir, exist_ok=True)
 
         for item in os.listdir(template_dir):
@@ -215,8 +452,7 @@ async def add_server(
         with open(os.path.join(server_dir, "server_settings.json"), "w", encoding="utf-8") as f:
             json.dump(s_settings, f, indent=4)
 
-        cfg = load_config()
-        entry = {"app_id": app_id, "executable": executable}
+        entry = {"app_id": app_id, "executable": executable, "instance_id": instance_id}
         if tcfg.get("username") and tcfg.get("password"):
             entry["username"] = tcfg["username"]
             entry["password"] = encrypt_value(tcfg["password"])
@@ -226,7 +462,7 @@ async def add_server(
         load_server_paths()
         load_server_configs()
 
-        await safe_send(ctx, f"📥 Starte Installation von **{name}**…", ephemeral=True)
+        await safe_send(ctx, f"Starte Installation von **{name}** (Instanz: `{instance_id}`)...", ephemeral=True)
         ok, message = await run_update(name)
         if not ok:
             # try anonymous fallback
@@ -264,7 +500,11 @@ async def add_server(
         if ch:
             await clean_channel(ch)
             await update_status_message(ch, safe_get_ip())
-        await safe_send(ctx, f"🎉 **{name}** aus Template '{template}' installiert und gestartet!", ephemeral=True)
+        await safe_send(
+            ctx,
+            f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{instance_id}`).",
+            ephemeral=True,
+        )
 
     except Exception as e:
         logging.exception("Fehler in add_server")
@@ -313,32 +553,239 @@ async def update_server(
 @bot.slash_command(name="removeserver", description="Entfernt einen Server komplett")
 @commands.has_role("Admin")
 @commands.cooldown(1, 5, commands.BucketType.user)
-async def remove_server(ctx: discord.ApplicationContext, name: Option(str, "Name des Servers", autocomplete=server_autocomplete)):
+async def remove_server(
+    ctx: discord.ApplicationContext,
+    name: Option(str, "Name des Servers", autocomplete=server_autocomplete),
+    backup_before_delete: Option(bool, "Vor dem Löschen ein ZIP-Backup erstellen", default=True),
+):
     await safe_defer(ctx, ephemeral=True)
     try:
         cfg = load_config()
         if name not in cfg["server_paths"]:
-            return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
+            return await safe_send(ctx, "Server nicht gefunden!", ephemeral=True)
+
+        load_server_paths()
+        target_server_path = SERVER_PATHS.get(name)
+        if not target_server_path:
+            app_id = str(cfg["server_paths"][name].get("app_id", ""))
+            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
+
         if name in server_processes:
             await stop_server(name)
-            await safe_send(ctx, f"⏹️ Server **{name}** gestoppt", ephemeral=True)
-        app_id = cfg["server_paths"][name]["app_id"]
-        server_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "steam", "GSM", "servers", str(app_id))
-        if os.path.exists(server_root):
+            await safe_send(ctx, f"Server **{name}** gestoppt.", ephemeral=True)
+
+        delete_root = _delete_root_from_server_path(target_server_path)
+        delete_root_norm = os.path.normcase(os.path.abspath(delete_root))
+        shared_with = None
+        for other_name, other_path in SERVER_PATHS.items():
+            if other_name == name:
+                continue
+            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
+            if other_root == delete_root_norm or other_root.startswith(delete_root_norm + os.sep):
+                shared_with = other_name
+                break
+
+        if os.path.exists(delete_root):
             import shutil
-            shutil.rmtree(server_root)
-            await safe_send(ctx, f"🗑️ Server-Verzeichnis gelöscht: `{server_root}`", ephemeral=True)
+            if shared_with:
+                await safe_send(
+                    ctx,
+                    f"Ordner bleibt erhalten, da auch `{shared_with}` ihn nutzt: `{delete_root}`",
+                    ephemeral=True,
+                )
+            else:
+                if backup_before_delete:
+                    try:
+                        archive_path = _create_directory_backup(delete_root, name)
+                        await safe_send(ctx, f"Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
+                    except Exception as backup_error:
+                        logging.exception("Backup vor remove fehlgeschlagen")
+                        return await safe_send(
+                            ctx,
+                            f"Backup fehlgeschlagen ({backup_error}). Entfernen wurde abgebrochen.",
+                            ephemeral=True,
+                        )
+                shutil.rmtree(delete_root)
+                await safe_send(ctx, f"Server-Verzeichnis gelöscht: `{delete_root}`", ephemeral=True)
+
         del cfg["server_paths"][name]
         save_config(cfg)
         load_server_paths()
         load_server_configs()
+        clear_server_status(name)
         ch = bot.get_channel(CHANNEL)
         if ch:
             await clean_channel(ch)
             await update_status_message(ch, safe_get_ip())
-        await safe_send(ctx, f"✅ Server **{name}** komplett entfernt.", ephemeral=True)
+        await safe_send(ctx, f"Server **{name}** komplett entfernt.", ephemeral=True)
     except Exception as e:
-        await safe_send(ctx, f"❌ Fehler beim Entfernen: {e}", ephemeral=True)
+        await safe_send(ctx, f"Fehler beim Entfernen: {e}", ephemeral=True)
+
+
+@bot.slash_command(name="createbackup", description="Erstellt ein ZIP-Backup eines Servers")
+@commands.has_role("Admin")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def create_backup(
+    ctx: discord.ApplicationContext,
+    name: Option(str, "Name des Servers", autocomplete=server_autocomplete),
+):
+    await safe_defer(ctx, ephemeral=True)
+
+    cfg = load_config()
+    if name not in cfg["server_paths"]:
+        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
+
+    load_server_paths()
+    target_server_path = SERVER_PATHS.get(name)
+    if not target_server_path:
+        entry = cfg["server_paths"].get(name, {})
+        app_id = str(entry.get("app_id", "")).strip()
+        if not app_id:
+            return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
+        instance_id = entry.get("instance_id")
+        if isinstance(instance_id, str) and instance_id.strip():
+            target_server_path = os.path.join(str(server_root(app_id, instance_id=instance_id)), "serverfiles")
+        else:
+            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
+
+    backup_root = _delete_root_from_server_path(target_server_path)
+    if not os.path.exists(backup_root):
+        return await safe_send(ctx, f"❌ Backup-Pfad existiert nicht: `{backup_root}`", ephemeral=True)
+
+    success = False
+    fail_reason = ""
+    status_finalized = False
+    begin_operation(name, "backup")
+    try:
+        archive_path = _create_directory_backup(backup_root, name)
+        write_action_log("createbackup", name, "success", os.path.basename(archive_path))
+        success = True
+        end_operation_success(name)
+        status_finalized = True
+
+        ch = bot.get_channel(CHANNEL)
+        if ch:
+            await clean_channel(ch)
+            await update_status_message(ch, safe_get_ip())
+        await safe_send(ctx, f"✅ Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
+    except Exception as e:
+        fail_reason = str(e)
+        write_action_log("createbackup", name, "failed", fail_reason)
+        logging.exception("create_backup fehlgeschlagen")
+        await safe_send(ctx, f"❌ Backup fehlgeschlagen: {e}", ephemeral=True)
+    finally:
+        if not status_finalized:
+            if success:
+                end_operation_success(name)
+            else:
+                end_operation_failed(name, fail_reason or "Backup fehlgeschlagen")
+
+
+@bot.slash_command(name="restorebackup", description="Stellt ein ZIP-Backup eines Servers wieder her")
+@commands.has_role("Admin")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def restore_backup(
+    ctx: discord.ApplicationContext,
+    name: Option(str, "Name des Servers", autocomplete=server_autocomplete),
+    backup_file: Option(str, "Backup-Datei aus /steam/backup", autocomplete=backup_autocomplete),
+    overwrite: Option(bool, "Zielordner vorher löschen", default=False),
+):
+    await safe_defer(ctx, ephemeral=True)
+
+    cfg = load_config()
+    if name not in cfg["server_paths"]:
+        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
+
+    archive_path = _resolve_backup_path(backup_file)
+    if not archive_path:
+        return await safe_send(ctx, "❌ Backup-Datei nicht gefunden.", ephemeral=True)
+
+    proc = server_processes.get(name)
+    try:
+        if proc and proc.is_running():
+            return await safe_send(ctx, "❌ Restore nicht möglich: Server läuft.", ephemeral=True)
+    except Exception:
+        pass
+
+    load_server_paths()
+    target_server_path = SERVER_PATHS.get(name)
+    if not target_server_path:
+        entry = cfg["server_paths"].get(name, {})
+        app_id = str(entry.get("app_id", "")).strip()
+        if not app_id:
+            return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
+        instance_id = entry.get("instance_id")
+        if isinstance(instance_id, str) and instance_id.strip():
+            target_server_path = os.path.join(str(server_root(app_id, instance_id=instance_id)), "serverfiles")
+        else:
+            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
+
+    restore_root = _delete_root_from_server_path(target_server_path)
+    restore_root_norm = os.path.normcase(os.path.abspath(restore_root))
+    if overwrite:
+        for other_name, other_path in SERVER_PATHS.items():
+            if other_name == name:
+                continue
+            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
+            if other_root == restore_root_norm or other_root.startswith(restore_root_norm + os.sep):
+                return await safe_send(
+                    ctx,
+                    f"❌ overwrite abgelehnt: Ordner wird auch von `{other_name}` genutzt.",
+                    ephemeral=True,
+                )
+
+    if os.path.exists(restore_root) and not overwrite:
+        try:
+            if any(os.scandir(restore_root)):
+                return await safe_send(
+                    ctx,
+                    "❌ Zielordner ist nicht leer. Nutze `overwrite=true`, um zuerst zu löschen.",
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+
+    success = False
+    fail_reason = ""
+    status_finalized = False
+    begin_operation(name, "restore")
+    try:
+        import shutil
+
+        if os.path.exists(restore_root) and overwrite:
+            shutil.rmtree(restore_root)
+        os.makedirs(restore_root, exist_ok=True)
+
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            if not _zip_members_are_safe(archive, restore_root):
+                fail_reason = "Backup enthält ungültige Pfade"
+                await safe_send(ctx, "❌ Backup enthält ungültige Pfade und wurde nicht entpackt.", ephemeral=True)
+                return
+            archive.extractall(restore_root)
+
+        load_server_paths()
+        load_server_configs()
+        write_action_log("restorebackup", name, "success", os.path.basename(archive_path))
+        success = True
+        end_operation_success(name)
+        status_finalized = True
+
+        ch = bot.get_channel(CHANNEL)
+        if ch:
+            await clean_channel(ch)
+            await update_status_message(ch, safe_get_ip())
+        await safe_send(ctx, f"✅ Backup wiederhergestellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
+    except Exception as e:
+        fail_reason = str(e)
+        write_action_log("restorebackup", name, "failed", fail_reason)
+        logging.exception("restore_backup fehlgeschlagen")
+        await safe_send(ctx, f"❌ Restore fehlgeschlagen: {e}", ephemeral=True)
+    finally:
+        if not status_finalized:
+            if success:
+                end_operation_success(name)
+            else:
+                end_operation_failed(name, fail_reason or "Restore fehlgeschlagen")
 
 
 @bot.slash_command(name="showserverconfig", description="Zeigt Konfiguration eines Servers")

@@ -1,10 +1,13 @@
-import json
+﻿import json
 import os
 import logging
+import shutil
+import tempfile
 from typing import Any, Dict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "server_config.json")
+CONFIG_BACKUP_PATH = f"{CONFIG_PATH}.bak"
 PID_CACHE = os.path.join(BASE_DIR, "server_pids.json")
 PLUGIN_TEMPLATES_DIR = os.path.join(BASE_DIR, "plugin_templates")
 STEAM_SESSIONS_DIR = os.path.join(BASE_DIR, "steam_sessions")
@@ -23,6 +26,8 @@ try:
         app_id: str
         executable: str | None = None
         username: str | None = None
+        instance_id: str | None = None
+        install_dir: str | None = None
         password: str | None = None  # verschlüsselt gespeichert
 
     class ConfigModel(BaseModel):
@@ -77,8 +82,30 @@ def load_config():
 def save_config(cfg):
     global CONFIG_CACHE, CONFIG_LAST_MODIFIED
     cfg = _validate_and_normalize(cfg)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+
+    config_dir = os.path.dirname(CONFIG_PATH) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix="server_config_", suffix=".tmp", dir=config_dir)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if os.path.exists(CONFIG_PATH):
+            try:
+                shutil.copy2(CONFIG_PATH, CONFIG_BACKUP_PATH)
+            except Exception as e:
+                logging.warning(f"Config-Backup konnte nicht geschrieben werden: {e}")
+
+        os.replace(tmp_path, CONFIG_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
     CONFIG_CACHE = cfg
     CONFIG_LAST_MODIFIED = os.path.getmtime(CONFIG_PATH)
 
