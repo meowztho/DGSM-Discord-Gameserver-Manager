@@ -31,23 +31,38 @@ from paths import (
     sanitize_instance_id,
 )
 from db import write_action_log
-from ui import update_status_message, clean_channel
+from ui import refresh_status_panel
 from server_manager import start_server, stop_server, server_processes
 from steam_integration import run_update, run_update_with_credentials, get_steamcmd_resolution
 from context import CHANNEL, safe_get_ip
-from runtime_status import begin_operation, end_operation_success, end_operation_failed, clear_server_status
+from runtime_status import (
+    begin_operation,
+    end_operation_success,
+    end_operation_failed,
+    clear_server_status,
+    get_operation_status,
+)
 
 
 # ---------- helper: robust defer & reply ----------
 async def safe_defer(ctx: discord.ApplicationContext, ephemeral: bool = True) -> bool:
     """Versucht zu deferren, gibt False zurück wenn das Interaction-Token schon ungültig ist."""
     try:
-        if getattr(ctx, "responded", False):
+        interaction = getattr(ctx, "interaction", None)
+        if getattr(ctx, "responded", False) or (
+            interaction is not None and interaction.response.is_done()
+        ):
             return True
         await ctx.defer(ephemeral=ephemeral)
         return True
     except discord.NotFound:
         # Unknown interaction – Token bereits ungültig
+        return False
+    except discord.HTTPException as e:
+        if getattr(e, "code", None) == 40060:
+            # Bereits bestätigt/deferred -> ok
+            return True
+        logging.warning(f"safe_defer HTTPException: {e}")
         return False
     except Exception as e:
         logging.warning(f"safe_defer: {e}")
@@ -62,23 +77,52 @@ async def safe_send(ctx: discord.ApplicationContext, content: Optional[str] = No
     - wenn deferred/geantwortet:   ctx.followup.send(...)
     - bei Unknown interaction:     ctx.channel.send(...) (nicht-ephemeral)
     """
-    try:
-        if getattr(ctx, "responded", False):
-            return await ctx.followup.send(content or "", embed=embed, ephemeral=ephemeral)
-        else:
-            return await ctx.respond(content or "", embed=embed, ephemeral=ephemeral)
-    except discord.NotFound:
-        # Interaction-Token ungültig → Fallback auf normalen Channel-Post
-        ch = ctx.channel
-        if ch:
+    message = content or ""
+    interaction = getattr(ctx, "interaction", None)
+    ch = getattr(ctx, "channel", None)
+
+    async def _channel_fallback():
+        if not ch:
+            return None
+        try:
             if ephemeral:
                 logging.warning("safe_send fallback: ephemeral content suppressed in public channel.")
                 return await ch.send("Antwort konnte nicht privat zugestellt werden. Bitte Befehl erneut ausführen.")
-            return await ch.send(content or "", embed=embed)
-        raise
+            return await ch.send(message, embed=embed)
+        except Exception as inner:
+            logging.warning(f"safe_send channel fallback failed: {inner}")
+            return None
+
+    try:
+        is_done = bool(getattr(ctx, "responded", False))
+        if not is_done and interaction is not None:
+            is_done = interaction.response.is_done()
+
+        if is_done:
+            return await ctx.followup.send(message, embed=embed, ephemeral=ephemeral)
+        return await ctx.respond(message, embed=embed, ephemeral=ephemeral)
+    except discord.NotFound:
+        return await _channel_fallback()
+    except discord.HTTPException as e:
+        code = getattr(e, "code", None)
+        if code == 40060:
+            try:
+                return await ctx.followup.send(message, embed=embed, ephemeral=ephemeral)
+            except Exception:
+                return await _channel_fallback()
+        if code == 10062:
+            return await _channel_fallback()
+        logging.warning(f"safe_send HTTPException: {e}")
+        return await _channel_fallback()
     except Exception as e:
-        logging.exception(f"safe_send failed: {e}")
-        raise
+        logging.warning(f"safe_send failed: {e}")
+        return await _channel_fallback()
+
+
+async def refresh_main_panel(user=None):
+    ch = bot.get_channel(CHANNEL)
+    if ch:
+        await refresh_status_panel(ch, user=user)
 
 
 def _make_instance_id(cfg: dict, app_id: str, preferred: str) -> str:
@@ -462,8 +506,18 @@ async def add_server(
         load_server_paths()
         load_server_configs()
 
+        async def _run_update_with_panel() -> tuple[bool, str]:
+            update_task = asyncio.create_task(run_update(name))
+            for _ in range(20):
+                state, _detail = get_operation_status(name)
+                if state == "busy" or update_task.done():
+                    break
+                await asyncio.sleep(0.05)
+            await refresh_main_panel()
+            return await update_task
+
         await safe_send(ctx, f"Starte Installation von **{name}** (Instanz: `{instance_id}`)...", ephemeral=True)
-        ok, message = await run_update(name)
+        ok, message = await _run_update_with_panel()
         if not ok:
             # try anonymous fallback
             if "No subscription" in message or "besitzt keine Lizenz" in message:
@@ -471,7 +525,7 @@ async def add_server(
                     cfg["server_paths"][name].pop("username", None)
                     cfg["server_paths"][name].pop("password", None)
                     save_config(cfg)
-                ok, message = await run_update(name)
+                ok, message = await _run_update_with_panel()
         if not ok:
             disk_free = 0.0
             try:
@@ -488,18 +542,17 @@ async def add_server(
             )
             await safe_send(ctx, debug, ephemeral=True)
             write_action_log("install", name, "failed", message)
+            await refresh_main_panel()
             return
 
         await safe_send(ctx, f"✅ Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
         if not await start_server(name):
             write_action_log("start_after_add", name, "failed")
+            await refresh_main_panel()
             return await safe_send(ctx, "❌ Start fehlgeschlagen!", ephemeral=True)
 
         write_action_log("start_after_add", name, "success")
-        ch = bot.get_channel(CHANNEL)
-        if ch:
-            await clean_channel(ch)
-            await update_status_message(ch, safe_get_ip())
+        await refresh_main_panel()
         await safe_send(
             ctx,
             f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{instance_id}`).",
@@ -613,10 +666,7 @@ async def remove_server(
         load_server_paths()
         load_server_configs()
         clear_server_status(name)
-        ch = bot.get_channel(CHANNEL)
-        if ch:
-            await clean_channel(ch)
-            await update_status_message(ch, safe_get_ip())
+        await refresh_main_panel()
         await safe_send(ctx, f"Server **{name}** komplett entfernt.", ephemeral=True)
     except Exception as e:
         await safe_send(ctx, f"Fehler beim Entfernen: {e}", ephemeral=True)
@@ -656,6 +706,7 @@ async def create_backup(
     fail_reason = ""
     status_finalized = False
     begin_operation(name, "backup")
+    await refresh_main_panel()
     try:
         archive_path = _create_directory_backup(backup_root, name)
         write_action_log("createbackup", name, "success", os.path.basename(archive_path))
@@ -663,10 +714,7 @@ async def create_backup(
         end_operation_success(name)
         status_finalized = True
 
-        ch = bot.get_channel(CHANNEL)
-        if ch:
-            await clean_channel(ch)
-            await update_status_message(ch, safe_get_ip())
+        await refresh_main_panel()
         await safe_send(ctx, f"✅ Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
     except Exception as e:
         fail_reason = str(e)
@@ -679,6 +727,7 @@ async def create_backup(
                 end_operation_success(name)
             else:
                 end_operation_failed(name, fail_reason or "Backup fehlgeschlagen")
+            await refresh_main_panel()
 
 
 @bot.slash_command(name="restorebackup", description="Stellt ein ZIP-Backup eines Servers wieder her")
@@ -749,6 +798,7 @@ async def restore_backup(
     fail_reason = ""
     status_finalized = False
     begin_operation(name, "restore")
+    await refresh_main_panel()
     try:
         import shutil
 
@@ -770,10 +820,7 @@ async def restore_backup(
         end_operation_success(name)
         status_finalized = True
 
-        ch = bot.get_channel(CHANNEL)
-        if ch:
-            await clean_channel(ch)
-            await update_status_message(ch, safe_get_ip())
+        await refresh_main_panel()
         await safe_send(ctx, f"✅ Backup wiederhergestellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
     except Exception as e:
         fail_reason = str(e)
@@ -786,6 +833,7 @@ async def restore_backup(
                 end_operation_success(name)
             else:
                 end_operation_failed(name, fail_reason or "Restore fehlgeschlagen")
+            await refresh_main_panel()
 
 
 @bot.slash_command(name="showserverconfig", description="Zeigt Konfiguration eines Servers")

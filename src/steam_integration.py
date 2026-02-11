@@ -4,7 +4,8 @@ import logging
 import os
 import shutil
 import time as time_lib
-from typing import Tuple, Optional, List
+from collections import defaultdict
+from typing import Dict, Tuple, Optional, List
 
 from config_store import BASE_DIR, STEAM_SESSIONS_DIR
 from config_store import load_config
@@ -16,6 +17,7 @@ from runtime_status import begin_operation, end_operation_success, end_operation
 # Konfiguration
 # ----------------------------
 DEFAULT_TIMEOUT = int(os.getenv("STEAMCMD_TIMEOUT", "7200"))  # 2h Default
+_UPDATE_LOCKS: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def _resolve_steamcmd() -> Tuple[Optional[str], str]:
@@ -134,190 +136,223 @@ def _install_looks_good(server_name: str, install_dir: str) -> bool:
         return False
 
 
+def is_update_running(server_name: str) -> bool:
+    lock = _UPDATE_LOCKS.get(server_name)
+    return bool(lock and lock.locked())
+
+
+def _output_has_success_marker(output: str) -> bool:
+    low = output.lower()
+    return "success! app '" in low and "fully installed" in low
+
+
+def _is_known_fatal_update_state(output: str) -> bool:
+    low = output.lower()
+    if "state is 0x606" in low:
+        return True
+    return ("error! app '" in low) and ("after update job" in low)
+
+
 # ----------------------------
 # SteamCMD
 # ----------------------------
 async def run_update(server_name: str) -> Tuple[bool, str]:
-    """
-    Falls steamcmd mit non-zero-Exit rausgeht, aber die Dateien da sind + EXE gefunden wurde,
-    behandeln wir das als Erfolg (mit Warnung). Timeout ist über STEAMCMD_TIMEOUT konfigurierbar.
-    """
-    success = False
-    fail_reason = ""
-    begin_operation(server_name, "update")
+    lock = _UPDATE_LOCKS[server_name]
+    if lock.locked():
+        logging.info(f"[STEAMCMD] {server_name}: paralleles Update abgelehnt (läuft bereits).")
+        return False, "Update läuft bereits"
 
-    try:
-        session_restored = restore_steam_session(server_name)
-        if session_restored:
-            logging.info(f"Steam-Session für {server_name} wiederhergestellt")
-
-        load_config()
-        paths.load_server_paths()
-        app_id = get_config_value(server_name, "app_id")
-        if not app_id:
-            fail_reason = "Keine App-ID konfiguriert"
-            return False, fail_reason
-
-        install_dir = paths.SERVER_PATHS.get(server_name) or os.path.join(
-            BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
-        )
-        os.makedirs(install_dir, exist_ok=True)
-
-        user = get_config_value(server_name, "username")
-        pw = get_config_value(server_name, "password")
-
-        steamcmd, steam_dir = _resolve_steamcmd()
-        if not steamcmd:
-            fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
-            return False, fail_reason
-
-        cmd: List[str] = [steamcmd, "+force_install_dir", install_dir]
-        if user and pw:
-            cmd.extend(["+login", user, pw])
-        else:
-            cmd.extend(["+login", "anonymous"])
-        cmd.extend(["+app_update", str(app_id), "validate", "+quit"])
-
-        start_time = time_lib.time()
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=steam_dir if os.path.isdir(steam_dir) else BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    async with lock:
+        success = False
+        fail_reason = ""
+        begin_operation(server_name, "update")
 
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DEFAULT_TIMEOUT)
-        except asyncio.TimeoutError:
-            if _install_looks_good(server_name, install_dir):
-                logging.warning(f"[STEAMCMD] Timeout, aber Dateien vorhanden → Erfolg: {server_name}")
-                save_steam_session(server_name)
-                success = True
-                return True, f"Timeout nach {DEFAULT_TIMEOUT/60:.0f} Min., aber Dateien vorhanden – weiter."
-            process.kill()
-            await process.communicate()
-            fail_reason = f"Timeout nach {DEFAULT_TIMEOUT/60:.0f} Minuten"
+            session_restored = restore_steam_session(server_name)
+            if session_restored:
+                logging.info(f"Steam-Session für {server_name} wiederhergestellt")
+
+            load_config()
+            paths.load_server_paths()
+            app_id = get_config_value(server_name, "app_id")
+            if not app_id:
+                fail_reason = "Keine App-ID konfiguriert"
+                return False, fail_reason
+
+            install_dir = paths.SERVER_PATHS.get(server_name) or os.path.join(
+                BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
+            )
+            os.makedirs(install_dir, exist_ok=True)
+
+            user = get_config_value(server_name, "username")
+            pw = get_config_value(server_name, "password")
+
+            steamcmd, steam_dir = _resolve_steamcmd()
+            if not steamcmd:
+                fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
+                return False, fail_reason
+
+            cmd: List[str] = [steamcmd, "+force_install_dir", install_dir]
+            if user and pw:
+                cmd.extend(["+login", user, pw])
+            else:
+                cmd.extend(["+login", "anonymous"])
+            cmd.extend(["+app_update", str(app_id), "validate", "+quit"])
+
+            start_time = time_lib.time()
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=steam_dir if os.path.isdir(steam_dir) else BASE_DIR,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DEFAULT_TIMEOUT)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                fail_reason = f"Timeout nach {DEFAULT_TIMEOUT/60:.0f} Minuten (SteamCMD beendet)"
+                return False, fail_reason
+
+            output = stdout.decode(errors="ignore") + stderr.decode(errors="ignore")
+            duration = time_lib.time() - start_time
+            logging.info(f"[STEAMCMD] {server_name} - Dauer: {duration:.2f}s\nOutput:\n{output}")
+
+            if process.returncode != 0:
+                if _is_known_fatal_update_state(output):
+                    fail_reason = (
+                        "SteamCMD meldet blockierten/parallelen Update-Job "
+                        "(z. B. state 0x606). Bitte später erneut versuchen."
+                    )
+                    return False, fail_reason
+
+                if _install_looks_good(server_name, install_dir) and _output_has_success_marker(output):
+                    logging.warning(
+                        f"[STEAMCMD] Non-zero Exit ({process.returncode}), aber Success-Marker gefunden: {server_name}"
+                    )
+                    save_steam_session(server_name)
+                    success = True
+                    return True, f"Installation offenbar ok (Exit {process.returncode})."
+
+                mappings = {
+                    "No subscription": "Account besitzt keine Lizenz",
+                    "Steam Guard": "2FA benötigt",
+                    "Invalid Password": "Ungültige Anmeldedaten",
+                    "Not logged in": "Anmeldung fehlgeschlagen",
+                    "0x202": "Verbindungsproblem",
+                    "App not released": "App nicht verfügbar",
+                    "Invalid platform": "Falsche Plattform",
+                    "missing dependency": "Fehlende Abhängigkeiten",
+                    "Access Denied": "Zugriffsrechte problem",
+                    "Disk write failure": "Speicherplatzproblem",
+                }
+                error_msg = f"Fehlercode: {process.returncode}"
+                for k, v in mappings.items():
+                    if k in output:
+                        error_msg = f"{v} | {error_msg}"
+                        break
+
+                fail_reason = f"{error_msg}\nAusgabe: {output[:1000]}"
+                return False, fail_reason
+
+            save_steam_session(server_name)
+            success = True
+            return True, f"Erfolgreich in {duration:.2f}s installiert"
+
+        except Exception as e:
+            logging.error(f"Kritischer Installationsfehler: {e}", exc_info=True)
+            fail_reason = f"Systemfehler: {e}"
             return False, fail_reason
 
-        output = stdout.decode(errors="ignore") + stderr.decode(errors="ignore")
-        duration = time_lib.time() - start_time
-        logging.info(f"[STEAMCMD] {server_name} - Dauer: {duration:.2f}s\nOutput:\n{output}")
-
-        if process.returncode != 0:
-            if _install_looks_good(server_name, install_dir):
-                logging.warning(f"[STEAMCMD] Non-zero Exit ({process.returncode}), aber Installation plausibel vollständig: {server_name}")
-                save_steam_session(server_name)
-                success = True
-                return True, f"Installation offenbar ok (Exit {process.returncode})."
-
-            mappings = {
-                "No subscription": "Account besitzt keine Lizenz",
-                "Steam Guard": "2FA benötigt",
-                "Invalid Password": "Ungültige Anmeldedaten",
-                "Not logged in": "Anmeldung fehlgeschlagen",
-                "0x202": "Verbindungsproblem",
-                "App not released": "App nicht verfügbar",
-                "Invalid platform": "Falsche Plattform",
-                "missing dependency": "Fehlende Abhängigkeiten",
-                "Access Denied": "Zugriffsrechte problem",
-                "Disk write failure": "Speicherplatzproblem",
-            }
-            error_msg = f"Fehlercode: {process.returncode}"
-            for k, v in mappings.items():
-                if k in output:
-                    error_msg = f"{v} | {error_msg}"
-                    break
-
-            fail_reason = f"{error_msg}\nAusgabe: {output[:1000]}"
-            return False, fail_reason
-
-        save_steam_session(server_name)
-        success = True
-        return True, f"Erfolgreich in {duration:.2f}s installiert"
-
-    except Exception as e:
-        logging.error(f"Kritischer Installationsfehler: {e}", exc_info=True)
-        fail_reason = f"Systemfehler: {e}"
-        return False, fail_reason
-
-    finally:
-        if success:
-            end_operation_success(server_name)
-        else:
-            end_operation_failed(server_name, fail_reason or "Update fehlgeschlagen")
+        finally:
+            if success:
+                end_operation_success(server_name)
+            else:
+                end_operation_failed(server_name, fail_reason or "Update fehlgeschlagen")
 
 
 async def run_update_with_credentials(server_name: str, username: str, password: str) -> Tuple[bool, str]:
-    success = False
-    fail_reason = ""
-    begin_operation(server_name, "update")
+    lock = _UPDATE_LOCKS[server_name]
+    if lock.locked():
+        logging.info(f"[STEAMCMD] {server_name}: paralleles Login-Update abgelehnt (läuft bereits).")
+        return False, "Update läuft bereits"
 
-    try:
-        paths.load_server_paths()
-        app_id = get_config_value(server_name, "app_id")
-        if not app_id:
-            fail_reason = "Keine App-ID konfiguriert"
-            return False, fail_reason
-
-        steamcmd, steam_dir = _resolve_steamcmd()
-        if not steamcmd:
-            fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
-            return False, fail_reason
-
-        install_dir = paths.SERVER_PATHS.get(server_name) or os.path.join(
-            BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
-        )
-
-        cmd = [
-            steamcmd, "+force_install_dir", install_dir,
-            "+login", username, password,
-            "+app_update", str(app_id), "validate", "+quit"
-        ]
-
-        start_time = time_lib.time()
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=steam_dir if os.path.isdir(steam_dir) else BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    async with lock:
+        success = False
+        fail_reason = ""
+        begin_operation(server_name, "update")
 
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DEFAULT_TIMEOUT)
-        except asyncio.TimeoutError:
-            if _install_looks_good(server_name, install_dir):
-                logging.warning(f"[STEAMCMD] Timeout (login), aber Dateien vorhanden → Erfolg: {server_name}")
-                save_steam_session(server_name)
-                success = True
-                return True, "Timeout, aber Dateien vorhanden – weiter."
-            process.kill()
-            await process.communicate()
-            fail_reason = "Timeout"
-            return False, fail_reason
+            paths.load_server_paths()
+            app_id = get_config_value(server_name, "app_id")
+            if not app_id:
+                fail_reason = "Keine App-ID konfiguriert"
+                return False, fail_reason
 
-        output = stdout.decode(errors="ignore") + stderr.decode(errors="ignore")
-        duration = time_lib.time() - start_time
-        logging.info(f"[STEAMCMD] {server_name} - Dauer: {duration:.2f}s\nOutput:\n{output}")
+            steamcmd, steam_dir = _resolve_steamcmd()
+            if not steamcmd:
+                fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
+                return False, fail_reason
 
-        if process.returncode != 0:
-            if _install_looks_good(server_name, install_dir):
-                logging.warning(f"[STEAMCMD] Non-zero Exit ({process.returncode}) nach Login, aber Installation plausibel vollständig: {server_name}")
-                save_steam_session(server_name)
-                success = True
-                return True, f"Installation offenbar ok (Exit {process.returncode})."
+            install_dir = paths.SERVER_PATHS.get(server_name) or os.path.join(
+                BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
+            )
 
-            error_msg = f"Fehlercode: {process.returncode}"
-            if "Steam Guard" in output:
-                error_msg = "2FA-Code ungültig oder abgelaufen"
-            fail_reason = f"{error_msg}\nAusgabe: {output[:500]}"
-            return False, fail_reason
+            cmd = [
+                steamcmd, "+force_install_dir", install_dir,
+                "+login", username, password,
+                "+app_update", str(app_id), "validate", "+quit"
+            ]
 
-        save_steam_session(server_name)
-        success = True
-        return True, f"Erfolgreich mit Login in {duration:.2f}s installiert"
+            start_time = time_lib.time()
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=steam_dir if os.path.isdir(steam_dir) else BASE_DIR,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-    finally:
-        if success:
-            end_operation_success(server_name)
-        else:
-            end_operation_failed(server_name, fail_reason or "Update fehlgeschlagen")
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DEFAULT_TIMEOUT)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                fail_reason = f"Timeout nach {DEFAULT_TIMEOUT/60:.0f} Minuten (SteamCMD beendet)"
+                return False, fail_reason
+
+            output = stdout.decode(errors="ignore") + stderr.decode(errors="ignore")
+            duration = time_lib.time() - start_time
+            logging.info(f"[STEAMCMD] {server_name} - Dauer: {duration:.2f}s\nOutput:\n{output}")
+
+            if process.returncode != 0:
+                if _is_known_fatal_update_state(output):
+                    fail_reason = (
+                        "SteamCMD meldet blockierten/parallelen Update-Job "
+                        "(z. B. state 0x606). Bitte später erneut versuchen."
+                    )
+                    return False, fail_reason
+
+                if _install_looks_good(server_name, install_dir) and _output_has_success_marker(output):
+                    logging.warning(
+                        f"[STEAMCMD] Non-zero Exit ({process.returncode}) nach Login, aber Success-Marker gefunden: {server_name}"
+                    )
+                    save_steam_session(server_name)
+                    success = True
+                    return True, f"Installation offenbar ok (Exit {process.returncode})."
+
+                error_msg = f"Fehlercode: {process.returncode}"
+                if "Steam Guard" in output:
+                    error_msg = "2FA-Code ungültig oder abgelaufen"
+                fail_reason = f"{error_msg}\nAusgabe: {output[:500]}"
+                return False, fail_reason
+
+            save_steam_session(server_name)
+            success = True
+            return True, f"Erfolgreich mit Login in {duration:.2f}s installiert"
+
+        finally:
+            if success:
+                end_operation_success(server_name)
+            else:
+                end_operation_failed(server_name, fail_reason or "Update fehlgeschlagen")
