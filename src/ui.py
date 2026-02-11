@@ -1,4 +1,5 @@
 ﻿import logging
+import asyncio
 import discord
 
 from context import user_has_permission
@@ -18,29 +19,52 @@ async def safe_inter_defer(inter: discord.Interaction, ephemeral: bool = True) -
         return True
     except discord.NotFound:
         return False
+    except discord.HTTPException as e:
+        if getattr(e, "code", None) == 40060:
+            return True
+        logging.warning(f"safe_inter_defer HTTPException: {e}")
+        return False
     except Exception as e:
         logging.warning(f"safe_inter_defer: {e}")
         return False
 
 
 async def safe_inter_send(inter: discord.Interaction, content: str, *, ephemeral: bool = True):
-    try:
-        if inter.response.is_done():
-            return await inter.followup.send(content, ephemeral=ephemeral)
-        else:
-            return await inter.response.send_message(content, ephemeral=ephemeral)
-    except discord.NotFound:
-        # Fallback: normaler Channel-Post (nicht-ephemeral möglich)
+    message = content or ""
+
+    async def _channel_fallback():
         try:
             if ephemeral:
                 logging.warning("safe_inter_send fallback: ephemeral content suppressed in public channel.")
                 return await inter.channel.send(
                     "Antwort konnte nicht privat zugestellt werden. Bitte Aktion erneut ausführen."
                 )
-            return await inter.channel.send(content)
+            return await inter.channel.send(message)
         except Exception as e:
-            logging.error(f"safe_inter_send fallback failed: {e}")
-            raise
+            logging.warning(f"safe_inter_send channel fallback failed: {e}")
+            return None
+
+    try:
+        if inter.response.is_done():
+            return await inter.followup.send(message, ephemeral=ephemeral)
+        else:
+            return await inter.response.send_message(message, ephemeral=ephemeral)
+    except discord.NotFound:
+        return await _channel_fallback()
+    except discord.HTTPException as e:
+        code = getattr(e, "code", None)
+        if code == 40060:
+            try:
+                return await inter.followup.send(message, ephemeral=ephemeral)
+            except Exception:
+                return await _channel_fallback()
+        if code == 10062:
+            return await _channel_fallback()
+        logging.warning(f"safe_inter_send HTTPException: {e}")
+        return await _channel_fallback()
+    except Exception as e:
+        logging.warning(f"safe_inter_send failed: {e}")
+        return await _channel_fallback()
 
 
 # ---------- basic channel utils ----------
@@ -95,6 +119,19 @@ async def disable_all_buttons(message):
         logging.error(f"Button-Deaktivierung fehlgeschlagen: {e}")
 
 
+async def refresh_status_panel(channel, user=None):
+    from context import safe_get_ip
+    await clean_channel(channel)
+    await update_status_message(channel, safe_get_ip(), user=user)
+
+
+def _short_message(msg: str, limit: int = 320) -> str:
+    text = " ".join(str(msg or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
 # ---------- buttons & view ----------
 class RefreshButton(discord.ui.Button):
     def __init__(self):
@@ -102,9 +139,7 @@ class RefreshButton(discord.ui.Button):
 
     async def callback(self, inter: discord.Interaction):
         await safe_inter_defer(inter, ephemeral=True)
-        await clean_channel(inter.channel)
-        from context import safe_get_ip
-        await update_status_message(inter.channel, safe_get_ip(), user=inter.user)
+        await refresh_status_panel(inter.channel, user=inter.user)
 
 
 class ServerButton(discord.ui.Button):
@@ -117,18 +152,39 @@ class ServerButton(discord.ui.Button):
             write_action_log("access_denied", self.name, "failed", f"User:{inter.user}")
             return await safe_inter_send(inter, "❌ Keine Berechtigung!", ephemeral=True)
         await safe_inter_defer(inter, ephemeral=True)
-        if self.name not in server_processes:
-            ok = await start_server(self.name)
-            write_action_log("start", self.name, "success" if ok else "failed")
-            msg = f"✅ {self.name} gestartet!" if ok else "❌ Fehler!"
+        try:
+            if inter.message:
+                await disable_all_buttons(inter.message)
+        except Exception:
+            pass
+
+        running = False
+        try:
+            proc = server_processes.get(self.name)
+            running = bool(proc and proc.is_running())
+        except Exception:
+            running = False
+
+        action = "stop" if running else "start"
+        action_task = asyncio.create_task(stop_server(self.name) if running else start_server(self.name))
+
+        # UI früh auf "busy" stellen, damit "🟡 Start läuft/🟡 Stopp läuft" sichtbar ist.
+        for _ in range(20):
+            state, _detail = get_operation_status(self.name)
+            if state == "busy" or action_task.done():
+                break
+            await asyncio.sleep(0.05)
+        await refresh_status_panel(inter.channel, user=inter.user)
+
+        ok = await action_task
+        write_action_log(action, self.name, "success" if ok else "failed")
+        if action == "start":
+            msg = f"✅ {self.name} gestartet!" if ok else "❌ Fehler beim Start!"
         else:
-            ok = await stop_server(self.name)
-            write_action_log("stop", self.name, "success" if ok else "failed")
-            msg = f"✅ {self.name} gestoppt!" if ok else "❌ Fehler!"
+            msg = f"✅ {self.name} gestoppt!" if ok else "❌ Fehler beim Stop!"
+
         await safe_inter_send(inter, msg, ephemeral=True)
-        await clean_channel(inter.channel)
-        from context import safe_get_ip
-        await update_status_message(inter.channel, safe_get_ip(), user=inter.user)
+        await refresh_status_panel(inter.channel, user=inter.user)
 
 
 class UpdateButton(discord.ui.Button):
@@ -140,16 +196,50 @@ class UpdateButton(discord.ui.Button):
         if not user_has_permission(inter.user):
             write_action_log("access_denied", self.name, "failed", f"User:{inter.user}")
             return await safe_inter_send(inter, "❌ Keine Berechtigung!", ephemeral=True)
-        if self.name in server_processes:
-            return await safe_inter_send(inter, "❌ Update nicht möglich: Server läuft!", ephemeral=True)
         await safe_inter_defer(inter, ephemeral=True)
+        proc = server_processes.get(self.name)
+        try:
+            if proc and proc.is_running():
+                await refresh_status_panel(inter.channel, user=inter.user)
+                return await safe_inter_send(inter, "❌ Update nicht möglich: Server läuft!", ephemeral=True)
+        except Exception:
+            pass
+        state, _detail = get_operation_status(self.name)
+        if state == "busy":
+            await refresh_status_panel(inter.channel, user=inter.user)
+            return await safe_inter_send(inter, f"ℹ️ Für {self.name} läuft bereits eine Aktion.", ephemeral=True)
+
         from steam_integration import run_update
-        ok, _msg = await run_update(self.name)
-        write_action_log("update", self.name, "success" if ok else "failed")
-        await safe_inter_send(inter, f"✅ Update {'erfolgreich' if ok else 'fehlgeschlagen'} für {self.name}", ephemeral=True)
-        await clean_channel(inter.channel)
-        from context import safe_get_ip
-        await update_status_message(inter.channel, safe_get_ip(), user=inter.user)
+
+        try:
+            if inter.message:
+                await disable_all_buttons(inter.message)
+        except Exception:
+            pass
+
+        update_task = asyncio.create_task(run_update(self.name))
+        for _ in range(20):
+            state, _detail = get_operation_status(self.name)
+            if state == "busy" or update_task.done():
+                break
+            await asyncio.sleep(0.05)
+
+        await refresh_status_panel(inter.channel, user=inter.user)
+
+        ok, msg = await update_task
+        detail = _short_message(msg)
+        write_action_log("update", self.name, "success" if ok else "failed", detail)
+
+        if ok:
+            response = f"✅ Update erfolgreich für {self.name}: {detail}"
+        elif "läuft bereits" in (detail or "").lower():
+            response = f"ℹ️ {self.name}: {detail}"
+        else:
+            response = f"❌ Update fehlgeschlagen für {self.name}: {detail or 'Unbekannter Fehler'}"
+
+        await safe_inter_send(inter, response, ephemeral=True)
+        await refresh_status_panel(inter.channel, user=inter.user)
+        return
 
 
 class ServerControlView(discord.ui.View):
@@ -162,14 +252,29 @@ class ServerControlView(discord.ui.View):
         row = 1
         cnt = 0
         for n in SERVER_PATHS:
-            style = discord.ButtonStyle.green if n not in server_processes else discord.ButtonStyle.red
-            self.add_item(ServerButton(n, style, row=row, disabled=not self.access))
+            running = False
+            try:
+                proc = server_processes.get(n)
+                running = bool(proc and proc.is_running())
+            except Exception:
+                running = False
+
+            state, _detail = get_operation_status(n)
+            busy = state == "busy"
+
+            style = discord.ButtonStyle.green if not running else discord.ButtonStyle.red
+            if busy:
+                style = discord.ButtonStyle.gray
+
+            button_disabled = (not self.access) or busy
+            self.add_item(ServerButton(n, style, row=row, disabled=button_disabled))
             cnt += 1
             if get_config_value(n, "app_id"):
                 if cnt >= 5:
                     row += 1
                     cnt = 0
-                self.add_item(UpdateButton(n, row=row, disabled=not self.access))
+                update_disabled = (not self.access) or busy or running
+                self.add_item(UpdateButton(n, row=row, disabled=update_disabled))
                 cnt += 1
             if cnt >= 5:
                 row += 1
