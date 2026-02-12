@@ -8,7 +8,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 ![Main Bot UI](docs/bot_ui.png)
 
-<img src="docs/GUI..png" alt="Main Bot UI" width="50%">
+<img src="docs/GUI..png" alt="Main Bot UI" width="75%">
 
 ---
 
@@ -167,7 +167,7 @@ DGSM_HIDE_CONSOLE_WHEN_UI=true
 | --------- | ------------- |
 |![Main Menu](docs/bot_ui.png)|![Server Status](docs/bot_status.png)|
 |![Server Status](docs/slashcommand.png)|![Server Status](docs/full.png)|
-|<img src="docs/GUI..png" alt="Main Bot UI" width="50%">|
+|<img src="docs/GUI..png" alt="Main Bot UI" width="75%">|
 
 ---
 
