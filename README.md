@@ -1,4 +1,4 @@
-<img width="1539" height="1020" alt="image" src="https://github.com/user-attachments/assets/4900fab7-88e6-455f-941c-3f4911490e47" /># DGSM – Discord Gameserver Manager
+# DGSM – Discord Gameserver Manager
 
 ![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
 
