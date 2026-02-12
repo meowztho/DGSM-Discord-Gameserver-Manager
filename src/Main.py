@@ -10,11 +10,13 @@ from paths import load_server_paths, load_server_configs
 from server_manager import recover_running_servers, monitor_servers
 
 from discord.ext import tasks
-from ui import clean_channel, update_status_message
+from ui import clean_channel, update_status_message, refresh_status_panel
 from server_manager import graceful_stop_all
+from desktop_ui import start_desktop_ui
 
 
 _monitor_task = None
+_desktop_ui_started = False
 
 
 @tasks.loop(time=time(hour=6, minute=0))
@@ -31,7 +33,7 @@ async def daily_update():
 
 @bot.event
 async def on_ready():
-    global _monitor_task
+    global _monitor_task, _desktop_ui_started
     try:
         init_db()
         cleanup_old_logs(get_log_retention_days())
@@ -44,6 +46,17 @@ async def on_ready():
         if ch:
             await clean_channel(ch)
             await update_status_message(ch, safe_get_ip(), user=None)
+        if not _desktop_ui_started:
+            async def _refresh_discord_from_desktop():
+                channel = bot.get_channel(CHANNEL)
+                if channel:
+                    await refresh_status_panel(channel, user=None)
+
+            started = start_desktop_ui(
+                asyncio.get_running_loop(),
+                refresh_callback=_refresh_discord_from_desktop,
+            )
+            _desktop_ui_started = bool(started)
         if not daily_update.is_running():
             daily_update.start()
         write_action_log("bot_start", "system", "success")

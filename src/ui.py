@@ -123,6 +123,16 @@ async def refresh_status_panel(channel, user=None):
     from context import safe_get_ip
     await clean_channel(channel)
     await update_status_message(channel, safe_get_ip(), user=user)
+    _notify_desktop_ui_refresh()
+
+
+def _notify_desktop_ui_refresh(reason: str = "") -> None:
+    try:
+        from desktop_ui import notify_external_refresh  # lazy import to avoid startup coupling
+
+        notify_external_refresh(reason)
+    except Exception:
+        pass
 
 
 def _short_message(msg: str, limit: int = 320) -> str:

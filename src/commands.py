@@ -3,6 +3,7 @@ import json
 import shlex
 import logging
 import asyncio
+import stat
 import zipfile
 from datetime import datetime
 from typing import Optional, List
@@ -123,6 +124,16 @@ async def refresh_main_panel(user=None):
     ch = bot.get_channel(CHANNEL)
     if ch:
         await refresh_status_panel(ch, user=user)
+    _notify_desktop_ui_refresh()
+
+
+def _notify_desktop_ui_refresh(reason: str = "") -> None:
+    try:
+        from desktop_ui import notify_external_refresh  # lazy import to avoid hard cycle at startup
+
+        notify_external_refresh(reason)
+    except Exception:
+        pass
 
 
 def _make_instance_id(cfg: dict, app_id: str, preferred: str) -> str:
@@ -162,6 +173,166 @@ def _delete_root_from_server_path(path: str) -> str:
     if os.path.basename(p).lower() == "serverfiles":
         return os.path.dirname(p)
     return p
+
+
+def _rmtree_onerror(func, path, exc_info):
+    err = exc_info
+    if isinstance(exc_info, tuple):
+        err = exc_info[1] if len(exc_info) > 1 else None
+    if isinstance(err, PermissionError):
+        try:
+            mode = stat.S_IWRITE | stat.S_IREAD
+            if os.path.isdir(path):
+                mode |= stat.S_IEXEC
+            os.chmod(path, mode)
+            result = func(path)
+            if hasattr(result, "close"):
+                try:
+                    result.close()
+                except Exception:
+                    pass
+            return
+        except Exception:
+            pass
+    if err is not None:
+        raise err
+    raise RuntimeError(f"Pfad konnte nicht gelöscht werden: {path}")
+
+
+def _blocking_rmtree(path: str) -> None:
+    import shutil
+
+    if os.name == "nt":
+        try:
+            shutil.rmtree(path, onexc=_rmtree_onerror)  # Python 3.12+
+            return
+        except TypeError:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+            return
+    shutil.rmtree(path)
+
+
+async def _rmtree_with_retry(path: str, retries: int = 5, base_delay: float = 0.35) -> None:
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            await asyncio.to_thread(_blocking_rmtree, path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as exc:
+            last_exc = exc
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 5:
+                last_exc = exc
+            else:
+                raise
+        await asyncio.sleep(base_delay * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Pfad konnte nicht gelöscht werden: {path}")
+
+
+def _is_access_denied_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "winerror", None) == 5:
+        return True
+    msg = str(exc).lower()
+    return ("winerror 5" in msg) or ("access denied" in msg) or ("zugriff verweigert" in msg)
+
+
+def _chmod_tree_writable(path: str) -> None:
+    root = os.path.abspath(path)
+    if not os.path.exists(root):
+        return
+    for base, dirs, files in os.walk(root, topdown=False):
+        for name in files:
+            p = os.path.join(base, name)
+            try:
+                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            except Exception:
+                pass
+        for name in dirs:
+            p = os.path.join(base, name)
+            try:
+                os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            except Exception:
+                pass
+    try:
+        mode = stat.S_IWRITE | stat.S_IREAD
+        if os.path.isdir(root):
+            mode |= stat.S_IEXEC
+        os.chmod(root, mode)
+    except Exception:
+        pass
+
+
+def _extract_zip_archive_safe(archive_path: str, target_dir: str, skip_access_denied: bool = False) -> List[str]:
+    skipped: List[str] = []
+    root = os.path.abspath(target_dir)
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        if not _zip_members_are_safe(archive, root):
+            raise RuntimeError("Backup enthält ungültige Pfade")
+
+        for info in archive.infolist():
+            name = info.filename or ""
+            if not name:
+                continue
+            dest = os.path.abspath(os.path.join(root, name))
+            try:
+                if os.path.commonpath([root, dest]) != root:
+                    raise RuntimeError("Backup enthält ungültige Pfade")
+            except Exception:
+                raise RuntimeError("Backup enthält ungültige Pfade")
+
+            if info.is_dir() or name.endswith("/"):
+                try:
+                    os.makedirs(dest, exist_ok=True)
+                    os.chmod(dest, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                except Exception as exc:
+                    if skip_access_denied and _is_access_denied_error(exc):
+                        skipped.append(name)
+                        continue
+                    raise
+                continue
+
+            parent = os.path.dirname(dest)
+            try:
+                os.makedirs(parent, exist_ok=True)
+                os.chmod(parent, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            except Exception as exc:
+                if skip_access_denied and _is_access_denied_error(exc):
+                    skipped.append(name)
+                    continue
+                raise
+
+            try:
+                if os.path.isdir(dest):
+                    _blocking_rmtree(dest)
+                elif os.path.exists(dest):
+                    try:
+                        os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
+                    except Exception:
+                        pass
+                    os.remove(dest)
+            except Exception as exc:
+                if skip_access_denied and _is_access_denied_error(exc):
+                    skipped.append(name)
+                    continue
+                raise
+
+            try:
+                with archive.open(info, "r") as src, open(dest, "wb") as dst:
+                    import shutil
+
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            except Exception as exc:
+                if skip_access_denied and _is_access_denied_error(exc):
+                    skipped.append(name)
+                    continue
+                raise
+    return skipped
 
 
 def _create_directory_backup(path: str, server_name: str) -> str:
@@ -639,7 +810,6 @@ async def remove_server(
                 break
 
         if os.path.exists(delete_root):
-            import shutil
             if shared_with:
                 await safe_send(
                     ctx,
@@ -649,7 +819,7 @@ async def remove_server(
             else:
                 if backup_before_delete:
                     try:
-                        archive_path = _create_directory_backup(delete_root, name)
+                        archive_path = await asyncio.to_thread(_create_directory_backup, delete_root, name)
                         await safe_send(ctx, f"Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
                     except Exception as backup_error:
                         logging.exception("Backup vor remove fehlgeschlagen")
@@ -658,7 +828,8 @@ async def remove_server(
                             f"Backup fehlgeschlagen ({backup_error}). Entfernen wurde abgebrochen.",
                             ephemeral=True,
                         )
-                shutil.rmtree(delete_root)
+                await asyncio.to_thread(_chmod_tree_writable, delete_root)
+                await _rmtree_with_retry(delete_root)
                 await safe_send(ctx, f"Server-Verzeichnis gelöscht: `{delete_root}`", ephemeral=True)
 
         del cfg["server_paths"][name]
@@ -706,9 +877,10 @@ async def create_backup(
     fail_reason = ""
     status_finalized = False
     begin_operation(name, "backup")
+    _notify_desktop_ui_refresh(f"{name}: backup running")
     await refresh_main_panel()
     try:
-        archive_path = _create_directory_backup(backup_root, name)
+        archive_path = await asyncio.to_thread(_create_directory_backup, backup_root, name)
         write_action_log("createbackup", name, "success", os.path.basename(archive_path))
         success = True
         end_operation_success(name)
@@ -798,20 +970,52 @@ async def restore_backup(
     fail_reason = ""
     status_finalized = False
     begin_operation(name, "restore")
+    _notify_desktop_ui_refresh(f"{name}: restore running")
     await refresh_main_panel()
     try:
-        import shutil
-
+        merge_fallback = False
+        skipped_locked_entries: List[str] = []
         if os.path.exists(restore_root) and overwrite:
-            shutil.rmtree(restore_root)
+            try:
+                await asyncio.to_thread(_chmod_tree_writable, restore_root)
+                await _rmtree_with_retry(restore_root)
+            except Exception as cleanup_exc:
+                if _is_access_denied_error(cleanup_exc):
+                    merge_fallback = True
+                    logging.warning("Restore cleanup fallback for %s due to locked path: %s", name, cleanup_exc)
+                else:
+                    raise
         os.makedirs(restore_root, exist_ok=True)
-
-        with zipfile.ZipFile(archive_path, "r") as archive:
-            if not _zip_members_are_safe(archive, restore_root):
-                fail_reason = "Backup enthält ungültige Pfade"
-                await safe_send(ctx, "❌ Backup enthält ungültige Pfade und wurde nicht entpackt.", ephemeral=True)
-                return
-            archive.extractall(restore_root)
+        last_extract_error = None
+        for attempt in range(2):
+            try:
+                skip_locked = attempt >= 1
+                skipped_items = await asyncio.to_thread(
+                    _extract_zip_archive_safe,
+                    archive_path,
+                    restore_root,
+                    skip_locked,
+                )
+                if skipped_items:
+                    skipped_locked_entries.extend(item for item in skipped_items if item not in skipped_locked_entries)
+                    write_action_log(
+                        "restorebackup",
+                        name,
+                        "warning",
+                        f"skipped locked entries: {', '.join(skipped_items[:6])}",
+                    )
+                last_extract_error = None
+                break
+            except Exception as extract_exc:
+                last_extract_error = extract_exc
+                if _is_access_denied_error(extract_exc):
+                    await asyncio.to_thread(_chmod_tree_writable, restore_root)
+                    await asyncio.sleep(0.45)
+                    continue
+                if attempt >= 1:
+                    raise
+        if last_extract_error is not None:
+            raise last_extract_error
 
         load_server_paths()
         load_server_configs()
@@ -822,11 +1026,25 @@ async def restore_backup(
 
         await refresh_main_panel()
         await safe_send(ctx, f"✅ Backup wiederhergestellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
+        if skipped_locked_entries:
+            await safe_send(
+                ctx,
+                f"⚠️ Teilweise Restore: gesperrte Pfade übersprungen ({', '.join(skipped_locked_entries[:4])}).",
+                ephemeral=True,
+            )
     except Exception as e:
         fail_reason = str(e)
+        if _is_access_denied_error(e):
+            try:
+                await asyncio.to_thread(_chmod_tree_writable, restore_root)
+            except Exception:
+                pass
+            fail_reason = (
+                f"{fail_reason} (access denied). Bitte Handles schließen und mit overwrite=true erneut versuchen."
+            )
         write_action_log("restorebackup", name, "failed", fail_reason)
         logging.exception("restore_backup fehlgeschlagen")
-        await safe_send(ctx, f"❌ Restore fehlgeschlagen: {e}", ephemeral=True)
+        await safe_send(ctx, f"❌ Restore fehlgeschlagen: {fail_reason}", ephemeral=True)
     finally:
         if not status_finalized:
             if success:
