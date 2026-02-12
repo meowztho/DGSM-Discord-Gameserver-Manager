@@ -1,4 +1,4 @@
-# DGSM – Discord Gameserver Manager
+<img width="1539" height="1020" alt="image" src="https://github.com/user-attachments/assets/4900fab7-88e6-455f-941c-3f4911490e47" /># DGSM – Discord Gameserver Manager
 
 ![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
 
@@ -8,11 +8,14 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 ![Main Bot UI](docs/bot_ui.png)
 
+![Main Bot UI](docs/GUI.png)
+
 ---
 
 ## ✨ Features
 
 - Start / Stop / Restart / Status via buttons and slash commands
+- Optional local **Windows Desktop UI**
 - Create ZIP backups via `/createbackup`
 - Restore server data from ZIP backups via `/restorebackup`
 - Live operation states in UI (start/stop/update/backup/restore)
@@ -122,12 +125,49 @@ Before running DGSM with a real token, you must create a bot account in the Disc
 
 ---
 
+## 🖥️ Local Windows Desktop UI (Addon)
+
+DGSM now includes a local desktop control window for Windows.
+
+- Starts automatically together with the bot
+- Uses **PySide6 (Qt for Python)** with a modern dark Soft-UI style
+- Uses the same backend logic as Discord commands
+- Discord stays the main control path
+- Includes card-based server controls and live console output
+- Settings changed in desktop UI are pushed to Discord status panel refresh
+- Unsaved setting edits stay in the form until you press `SAVE CFG`
+
+Dependency note:
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs `PySide6` for the desktop UI.
+
+Environment toggle:
+
+```env
+DGSM_DESKTOP_UI_ENABLED=true
+```
+
+Set it to `false` to disable the desktop window.
+
+Optional: hide the separate console window while desktop UI is open:
+
+```env
+DGSM_HIDE_CONSOLE_WHEN_UI=true
+```
+
+---
+
 ## 📷 Screenshots
 
 | Main Menu | Server Status |
 | --------- | ------------- |
 |![Main Menu](docs/bot_ui.png)|![Server Status](docs/bot_status.png)|
 |![Server Status](docs/slashcommand.png)|![Server Status](docs/full.png)|
+|![Main Bot UI](docs/GUI.png)|
 
 ---
 
