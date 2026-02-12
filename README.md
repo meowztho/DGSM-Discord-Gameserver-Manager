@@ -8,7 +8,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 ![Main Bot UI](docs/bot_ui.png)
 
-![Main Bot UI](docs/GUI.png)
+![Main Bot UI](docs/GUI..png)
 
 ---
 
