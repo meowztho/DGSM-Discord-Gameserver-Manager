@@ -4,6 +4,8 @@ import logging
 import os
 import shutil
 import time as time_lib
+import urllib.request
+import zipfile
 from collections import defaultdict
 from typing import Dict, Tuple, Optional, List
 
@@ -17,6 +19,7 @@ from runtime_status import begin_operation, end_operation_success, end_operation
 # Konfiguration
 # ----------------------------
 DEFAULT_TIMEOUT = int(os.getenv("STEAMCMD_TIMEOUT", "7200"))  # 2h Default
+DEFAULT_STEAMCMD_DOWNLOAD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 _UPDATE_LOCKS: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
@@ -55,6 +58,96 @@ def _resolve_steamcmd() -> Tuple[Optional[str], str]:
                 return abs_path, os.path.dirname(abs_path)
 
     return None, default_dir
+
+
+def _env_file_path() -> str:
+    return os.path.join(BASE_DIR, ".env")
+
+
+def _upsert_env_value(key: str, value: str) -> None:
+    env_path = _env_file_path()
+    lines: List[str] = []
+    found = False
+
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except Exception:
+            lines = []
+
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+
+    try:
+        with open(env_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines).rstrip() + "\n")
+    except Exception:
+        logging.exception("SteamCMD env update failed for %s", key)
+
+
+def _steamcmd_download_url() -> str:
+    key = "STEAMCMD_DOWNLOAD_URL"
+    url = (os.getenv(key) or "").strip()
+    if not url:
+        url = DEFAULT_STEAMCMD_DOWNLOAD_URL
+        os.environ[key] = url
+        _upsert_env_value(key, url)
+    return url
+
+
+def _download_and_extract_steamcmd(target_dir: str, url: str) -> None:
+    os.makedirs(target_dir, exist_ok=True)
+    archive_path = os.path.join(target_dir, "steamcmd.zip")
+    tmp_path = archive_path + ".part"
+
+    with urllib.request.urlopen(url, timeout=120) as response, open(tmp_path, "wb") as out:
+        shutil.copyfileobj(response, out, length=1024 * 1024)
+    os.replace(tmp_path, archive_path)
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archive.extractall(target_dir)
+
+    try:
+        os.remove(archive_path)
+    except Exception:
+        pass
+
+    if os.name != "nt":
+        for name in ("steamcmd.sh", "steamcmd"):
+            p = os.path.join(target_dir, name)
+            if os.path.isfile(p):
+                try:
+                    os.chmod(p, 0o755)
+                except Exception:
+                    pass
+
+
+def ensure_steamcmd_available() -> Tuple[bool, str]:
+    steamcmd, steam_dir = _resolve_steamcmd()
+    if steamcmd:
+        return True, f"SteamCMD found: {steamcmd}"
+
+    env_path = (os.getenv("STEAMCMD_PATH") or "").strip().strip('"').strip("'")
+    if env_path:
+        return False, f"SteamCMD not found at STEAMCMD_PATH='{env_path}'"
+
+    url = _steamcmd_download_url()
+    try:
+        logging.info("SteamCMD missing, downloading to %s", steam_dir)
+        _download_and_extract_steamcmd(steam_dir, url)
+    except Exception as exc:
+        return False, f"SteamCMD auto-download failed: {exc}"
+
+    steamcmd, _steam_dir = _resolve_steamcmd()
+    if steamcmd:
+        return True, f"SteamCMD downloaded: {steamcmd}"
+    return False, "SteamCMD downloaded, but executable could not be resolved"
 
 
 def get_steamcmd_resolution() -> Tuple[Optional[str], str]:
@@ -189,8 +282,14 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
 
             steamcmd, steam_dir = _resolve_steamcmd()
             if not steamcmd:
-                fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
-                return False, fail_reason
+                ok_cmd, cmd_message = ensure_steamcmd_available()
+                if not ok_cmd:
+                    fail_reason = f"SteamCMD nicht gefunden ({cmd_message})"
+                    return False, fail_reason
+                steamcmd, steam_dir = _resolve_steamcmd()
+                if not steamcmd:
+                    fail_reason = "SteamCMD nicht gefunden (nach Auto-Download)"
+                    return False, fail_reason
 
             cmd: List[str] = [steamcmd, "+force_install_dir", install_dir]
             if user and pw:
@@ -292,8 +391,14 @@ async def run_update_with_credentials(server_name: str, username: str, password:
 
             steamcmd, steam_dir = _resolve_steamcmd()
             if not steamcmd:
-                fail_reason = "SteamCMD nicht gefunden (STEAMCMD_PATH oder PATH prüfen)"
-                return False, fail_reason
+                ok_cmd, cmd_message = ensure_steamcmd_available()
+                if not ok_cmd:
+                    fail_reason = f"SteamCMD nicht gefunden ({cmd_message})"
+                    return False, fail_reason
+                steamcmd, steam_dir = _resolve_steamcmd()
+                if not steamcmd:
+                    fail_reason = "SteamCMD nicht gefunden (nach Auto-Download)"
+                    return False, fail_reason
 
             install_dir = paths.SERVER_PATHS.get(server_name) or os.path.join(
                 BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
