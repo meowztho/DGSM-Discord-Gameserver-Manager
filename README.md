@@ -9,13 +9,13 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 ![Main Bot UI](docs/bot_ui.png)
 
 <img src="docs/GUI..png" alt="Main Bot UI" width="75%">
-
 ---
 
 ## ✨ Features
 
 - Start / Stop / Restart / Status via buttons and slash commands
 - Optional local **Windows Desktop UI**
+- UI-only startup mode if Discord env values are missing
 - Create ZIP backups via `/createbackup`
 - Restore server data from ZIP backups via `/restorebackup`
 - Live operation states in UI (start/stop/update/backup/restore)
@@ -23,7 +23,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
 - Role & permission checks for admin actions
 - SQLite logging, JSON configuration
-- **First run setup**: guided prompt for required `.env` values
+- Automatic SteamCMD download (if missing) into `src/steam/`
 - Runs on Windows servers without RDP
 
 ---
@@ -49,7 +49,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
    pip install -r requirements.txt
    ```
 
-4. **First run setup**\
+4. **First run**\
    Simply start the bot:
 
    ```bash
@@ -62,8 +62,9 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
    On first run, DGSM will:
 
-   - Prompt for missing required values (`DISCORD_TOKEN`, channels, domain)
-   - Encrypt sensitive values in `src/.env`
+   - Load values from `src/.env` (if present)
+   - Auto-create `ENCRYPTION_KEY` in `src/.env` if missing
+   - Start in UI-only mode if Discord env is incomplete
    - Load server entries from `src/server_config.json` (if present)
 
    After setup:
@@ -72,6 +73,35 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
    - Add servers via `/addserver` (recommended) or directly in `src/server_config.json`
    - For a second server with the same template/app, set `instance_id` in `/addserver` (optional)
    - Backups are stored in `src/steam/backup`
+
+---
+
+## 🚀 Release Package (Code + Dist)
+
+From `v2.0.1`, releases can include both:
+
+- full source code (as before)
+- prebuilt Windows package in `dist/DGSM/`
+
+Detailed changes for this release: [RELEASE_NOTES_v2.0.1.md](RELEASE_NOTES_v2.0.1.md)
+
+Start prebuilt version with:
+
+```powershell
+dist\DGSM\DGSM.exe
+```
+
+Important: keep the source tree next to `dist`, because runtime data stays in `src/`.
+
+Runtime paths used by DGSM:
+
+- `src/.env`
+- `src/server_config.json`
+- `src/server_pids.json`
+- `src/plugin_templates/`
+- `src/steam/`
+- `src/steam/steamcmd.exe`
+- `src/steam/GSM/servers/`
 
 ---
 
@@ -134,6 +164,7 @@ DGSM now includes a local desktop control window for Windows.
 - Uses the same backend logic as Discord commands
 - Discord stays the main control path
 - Includes card-based server controls and live console output
+- Reflects Discord-side command state changes in the desktop dashboard
 - Settings changed in desktop UI are pushed to Discord status panel refresh
 - Unsaved setting edits stay in the form until you press `SAVE CFG`
 
@@ -161,13 +192,30 @@ DGSM_HIDE_CONSOLE_WHEN_UI=true
 
 ---
 
+## 🛠️ Build Windows EXE
+
+Use the included build script:
+
+```powershell
+build.bat
+```
+
+The script:
+
+- builds `dist/DGSM/DGSM.exe` with PyInstaller
+- embeds `src/Logo.ico` as executable icon
+- keeps runtime path logic aligned with `src/`
+- ensures required runtime folders exist (`src/steam/GSM/servers`, `src/plugin_templates`)
+
+---
+
 ## 📷 Screenshots
 
 | Main Menu | Server Status |
 | --------- | ------------- |
 |![Main Menu](docs/bot_ui.png)|![Server Status](docs/bot_status.png)|
 |![Server Status](docs/slashcommand.png)|![Server Status](docs/full.png)|
-|<img src="docs/GUI..png" alt="Main Bot UI" width="75%">|
+<img src="docs/GUI..png" alt="Main Bot UI" width="75%">
 
 ---
 
@@ -175,14 +223,16 @@ DGSM_HIDE_CONSOLE_WHEN_UI=true
 
 Some servers require SteamCMD to install or update.
 
-1. Download from Valve:\
-   [https://developer.valvesoftware.com/wiki/SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
-
-2. DGSM supports these SteamCMD locations:
+1. DGSM supports these SteamCMD locations:
 
    - `steam/steamcmd.exe` relative to `Main.py` directory (this is `src/steam/steamcmd.exe` when started from repo root)
    - Path from env variable `STEAMCMD_PATH`
    - Any SteamCMD available in your system `PATH`
+
+2. If SteamCMD is not found, DGSM can auto-download it to `src/steam/` using:
+
+   - `STEAMCMD_DOWNLOAD_URL` from `src/.env`
+   - default: `https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip`
 
 3. Optional: set `STEAMCMD_PATH` in `src/.env`, for example:
 
