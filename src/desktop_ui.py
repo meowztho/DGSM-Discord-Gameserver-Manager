@@ -80,6 +80,11 @@ _ACTION_FEEDBACK: Dict[str, Dict[str, str | int]] = {}
 _LIVE_LOG_LINES: deque[str] = deque(maxlen=1200)
 _STOP_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _APP_STARTED_TS = time.time()
+_PROC_NET_SAMPLE: Dict[int, Tuple[int, int]] = {}
+_PROC_NET_SAMPLE_TS = 0.0
+_PROC_CPU_SAMPLE: Dict[int, float] = {}
+_PROC_CPU_SAMPLE_TS = 0.0
+_APP_ICON = None
 
 _THEME = {
     "bg": "#131826",
@@ -138,13 +143,58 @@ def _find_logo_file() -> Optional[str]:
     return None
 
 
+def _find_logo_icon_file() -> Optional[str]:
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, "Logo.ico"),
+        os.path.join(base, "logo.ico"),
+        os.path.join(base, "..", "docs", "Logo.ico"),
+        os.path.join(base, "..", "docs", "logo.ico"),
+        os.path.join(base, "docs", "images", "Logo.ico"),
+        os.path.join(base, "docs", "images", "logo.ico"),
+        os.path.join(base, "Logo.png"),
+        os.path.join(base, "logo.png"),
+        os.path.join(base, "..", "docs", "Logo.png"),
+        os.path.join(base, "..", "docs", "logo.png"),
+        os.path.join(base, "docs", "images", "Logo.png"),
+        os.path.join(base, "docs", "images", "logo.png"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _load_logo_icon() -> Optional[QIcon]:
     if QIcon is None:
         return None
-    path = _find_logo_file()
+    path = _find_logo_icon_file()
     if not path:
         return None
-    icon = QIcon(path)
+
+    lower = path.lower()
+    if lower.endswith(".ico"):
+        icon = QIcon(path)
+        if icon.isNull():
+            return None
+        return icon
+
+    if QPixmap is None:
+        return None
+    pix = QPixmap(path)
+    if pix.isNull():
+        return None
+    pix = _trim_transparent_logo(pix)
+
+    icon = QIcon()
+    for sz in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+        scaled = pix.scaled(
+            sz,
+            sz,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        icon.addPixmap(scaled)
     if icon.isNull():
         return None
     return icon
@@ -250,6 +300,142 @@ def _format_uptime(seconds: float) -> str:
     return f"{minutes}m"
 
 
+def _is_within_path(base_dir: str, candidate: str) -> bool:
+    try:
+        base_abs = os.path.normcase(os.path.abspath(base_dir))
+        cand_abs = os.path.normcase(os.path.abspath(candidate))
+        return os.path.commonpath([base_abs, cand_abs]) == base_abs
+    except Exception:
+        return False
+
+
+def _running_server_roots(rows: Optional[List[Dict[str, object]]] = None) -> List[str]:
+    names: set[str] = set()
+    if rows:
+        for row in rows:
+            name = str(row.get("name", "") or "").strip()
+            if not name:
+                continue
+            state = str(row.get("state", "stopped")).lower()
+            running_flag = bool(row.get("running", False))
+            if running_flag or state == "running":
+                names.add(name)
+
+    if not names:
+        for name, proc in list(server_processes.items()):
+            try:
+                if proc is not None and proc.is_running():
+                    names.add(str(name))
+            except Exception:
+                continue
+
+    roots: List[str] = []
+    for name in names:
+        root = SERVER_PATHS.get(name)
+        if root:
+            roots.append(os.path.normcase(os.path.abspath(root)))
+
+    seen: set[str] = set()
+    unique: List[str] = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            unique.append(root)
+    return unique
+
+
+def _collect_scoped_process_metrics(scope_roots: List[str]) -> Tuple[float, int, float, float]:
+    """
+    Best-effort metrics for processes inside the given server roots.
+    Returns: (cpu_percent, rss_bytes, upload_per_sec, download_per_sec)
+    """
+    global _PROC_NET_SAMPLE, _PROC_NET_SAMPLE_TS, _PROC_CPU_SAMPLE, _PROC_CPU_SAMPLE_TS
+    if psutil is None:
+        return 0.0, 0, 0.0, 0.0
+
+    if not scope_roots:
+        _PROC_CPU_SAMPLE = {}
+        _PROC_NET_SAMPLE = {}
+        _PROC_CPU_SAMPLE_TS = time.time()
+        _PROC_NET_SAMPLE_TS = _PROC_CPU_SAMPLE_TS
+        return 0.0, 0, 0.0, 0.0
+
+    now = time.time()
+    current_cpu: Dict[int, float] = {}
+    current: Dict[int, Tuple[int, int]] = {}
+    rss_total = 0
+    try:
+        for proc in psutil.process_iter(attrs=["pid", "exe", "cwd"]):
+            try:
+                exe = str(proc.info.get("exe") or "")
+                cwd = str(proc.info.get("cwd") or "")
+                in_scope = False
+                for root in scope_roots:
+                    if (exe and _is_within_path(root, exe)) or (cwd and _is_within_path(root, cwd)):
+                        in_scope = True
+                        break
+                if not in_scope:
+                    continue
+                cpu_times = proc.cpu_times()
+                total_cpu_time = float(getattr(cpu_times, "user", 0.0) or 0.0) + float(getattr(cpu_times, "system", 0.0) or 0.0)
+                current_cpu[int(proc.pid)] = total_cpu_time
+
+                mem = proc.memory_info()
+                rss_total += int(getattr(mem, "rss", 0) or 0)
+
+                io = proc.io_counters()
+                read_bytes = int(getattr(io, "read_bytes", 0) or 0)
+                write_bytes = int(getattr(io, "write_bytes", 0) or 0)
+                current[int(proc.pid)] = (read_bytes, write_bytes)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                continue
+    except Exception:
+        return 0.0, 0, 0.0, 0.0
+
+    proc_cpu_percent = 0.0
+    elapsed_cpu = now - _PROC_CPU_SAMPLE_TS
+    if _PROC_CPU_SAMPLE and elapsed_cpu > 0:
+        delta_cpu = 0.0
+        for pid, total_now in current_cpu.items():
+            prev_total = _PROC_CPU_SAMPLE.get(pid)
+            if prev_total is None:
+                continue
+            if total_now >= prev_total:
+                delta_cpu += total_now - prev_total
+        cpu_count = int(psutil.cpu_count(logical=True) or 1)
+        if cpu_count < 1:
+            cpu_count = 1
+        proc_cpu_percent = (delta_cpu / elapsed_cpu) * 100.0 / cpu_count
+        proc_cpu_percent = max(0.0, min(100.0, proc_cpu_percent))
+
+    _PROC_CPU_SAMPLE = current_cpu
+    _PROC_CPU_SAMPLE_TS = now
+
+    elapsed = now - _PROC_NET_SAMPLE_TS
+    if not _PROC_NET_SAMPLE or elapsed <= 0:
+        _PROC_NET_SAMPLE = current
+        _PROC_NET_SAMPLE_TS = now
+        return proc_cpu_percent, rss_total, 0.0, 0.0
+
+    delta_read = 0
+    delta_write = 0
+    for pid, (read_now, write_now) in current.items():
+        prev = _PROC_NET_SAMPLE.get(pid)
+        if not prev:
+            continue
+        read_prev, write_prev = prev
+        if read_now >= read_prev:
+            delta_read += read_now - read_prev
+        if write_now >= write_prev:
+            delta_write += write_now - write_prev
+
+    _PROC_NET_SAMPLE = current
+    _PROC_NET_SAMPLE_TS = now
+    return (proc_cpu_percent, rss_total, delta_write / elapsed, delta_read / elapsed)
+
+
 def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> Dict[str, str]:
     running = 0
     if rows:
@@ -265,14 +451,24 @@ def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> D
     if psutil is None:
         return metrics
 
+    proc_cpu = 0.0
+    proc_rss = 0
+    proc_up = 0.0
+    proc_down = 0.0
+    try:
+        proc_cpu, proc_rss, proc_up, proc_down = _collect_scoped_process_metrics(_running_server_roots(rows))
+    except Exception:
+        pass
+
     try:
         cpu = psutil.cpu_percent(interval=None)
-        metrics["cpu"] = f"{cpu:.0f}%"
+        metrics["cpu"] = f"{cpu:.0f}% | proc {proc_cpu:.1f}%"
     except Exception:
         pass
     try:
         mem = psutil.virtual_memory()
-        metrics["ram"] = f"{mem.percent:.0f}%"
+        proc_ram_pct = (float(proc_rss) / float(mem.total) * 100.0) if getattr(mem, "total", 0) else 0.0
+        metrics["ram"] = f"{mem.percent:.0f}% | proc {_human_bytes(proc_rss)} ({proc_ram_pct:.1f}%)"
     except Exception:
         pass
     try:
@@ -282,7 +478,10 @@ def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> D
         pass
     try:
         net = psutil.net_io_counters()
-        metrics["network"] = f"↑ {_human_bytes(net.bytes_sent)} ↓ {_human_bytes(net.bytes_recv)}"
+        metrics["network"] = (
+            f"↑ {_human_bytes(net.bytes_sent)} | ↓ {_human_bytes(net.bytes_recv)} | "
+            f"proc↑ {_human_bytes(proc_up)}/s | proc↓ {_human_bytes(proc_down)}/s"
+        )
     except Exception:
         pass
     return metrics
@@ -452,6 +651,16 @@ def notify_external_refresh(reason: str = "") -> None:
         loop.call_soon_threadsafe(_kick)
     except Exception:
         pass
+
+
+def is_desktop_ui_active() -> bool:
+    window = _QT_WINDOW
+    return bool(_STARTED and window is not None and window.isVisible())
+
+
+def is_desktop_ui_started() -> bool:
+    return bool(_STARTED)
+
 
 async def _wait_busy_or_done(name: str, task: asyncio.Task) -> None:
     for _ in range(32):
@@ -2673,7 +2882,7 @@ async def _qt_event_pump() -> None:
 
 
 def _start_qt_ui(loop: asyncio.AbstractEventLoop) -> None:
-    global _QT_APP, _QT_WINDOW, _QT_PUMP_TASK, _STARTED
+    global _QT_APP, _QT_WINDOW, _QT_PUMP_TASK, _STARTED, _APP_ICON
     try:
         _set_windows_app_user_model_id()
         app = QApplication.instance()
@@ -2681,6 +2890,7 @@ def _start_qt_ui(loop: asyncio.AbstractEventLoop) -> None:
             app = QApplication([])
             app.setStyle("Fusion")
         icon = _load_logo_icon()
+        _APP_ICON = icon
         if icon is not None:
             app.setWindowIcon(icon)
         _QT_APP = app
@@ -2691,6 +2901,11 @@ def _start_qt_ui(loop: asyncio.AbstractEventLoop) -> None:
             window.setWindowIcon(icon)
         _QT_WINDOW = window
         window.show()
+        if icon is not None:
+            window.setWindowIcon(icon)
+            handle = window.windowHandle()
+            if handle is not None:
+                handle.setIcon(icon)
         window.raise_()
         window.activateWindow()
 

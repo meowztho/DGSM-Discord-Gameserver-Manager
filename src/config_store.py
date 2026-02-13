@@ -1,11 +1,31 @@
 ﻿import json
 import os
+import sys
 import logging
 import shutil
 import tempfile
 from typing import Any, Dict
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def _runtime_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates = [
+            os.path.join(exe_dir, "src"),
+            os.path.join(os.path.dirname(exe_dir), "src"),
+            os.path.join(os.path.dirname(os.path.dirname(exe_dir)), "src"),
+            os.path.join(os.getcwd(), "src"),
+            exe_dir,
+        ]
+        for candidate in candidates:
+            try:
+                if os.path.isdir(candidate):
+                    return os.path.abspath(candidate)
+            except Exception:
+                continue
+        return os.path.abspath(exe_dir)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _runtime_base_dir()
 CONFIG_PATH = os.path.join(BASE_DIR, "server_config.json")
 CONFIG_BACKUP_PATH = f"{CONFIG_PATH}.bak"
 PID_CACHE = os.path.join(BASE_DIR, "server_pids.json")
