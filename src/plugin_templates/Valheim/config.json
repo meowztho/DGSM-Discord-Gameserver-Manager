@@ -1,0 +1,22 @@
+{
+    "app_id": "896660",
+    "executable": "valheim_server.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+        "-nographics",
+        "-batchmode",
+        "-name",
+        "My Valheim Server",
+        "-port",
+        "2456",
+        "-world",
+        "Dedicated",
+        "-password",
+        "ChangeMe123",
+        "-public",
+        "1"
+    ]
+}

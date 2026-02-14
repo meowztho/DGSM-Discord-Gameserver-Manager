@@ -1,0 +1,32 @@
+{
+    "app_id": "258550",
+    "executable": "RustDedicated.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+        "+server.port",
+        "28015",
+        "+server.level",
+        "Procedural Map",
+        "+server.seed",
+        "12345",
+        "+server.worldsize",
+        "3500",
+        "+server.maxplayers",
+        "50",
+        "+server.hostname",
+        "My Rust Server",
+        "+server.identity",
+        "rust_server",
+        "+rcon.port",
+        "28016",
+        "+rcon.password",
+        "ChangeMeRcon",
+        "+rcon.web",
+        "1",
+        "-logfile",
+        "output_log.txt"
+    ]
+}
