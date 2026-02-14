@@ -1,0 +1,17 @@
+{
+    "app_id": "294420",
+    "executable": "7DaysToDieServer.exe",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+        "-quit",
+        "-batchmode",
+        "-nographics",
+        "-dedicated",
+        "-configfile=serverconfig.xml",
+        "-logfile",
+        "output_log.txt"
+    ]
+}
