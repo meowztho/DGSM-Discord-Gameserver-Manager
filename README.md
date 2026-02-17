@@ -346,6 +346,33 @@ Notes:
 
 ---
 
+## Project Scope & Design Philosophy
+
+DGSM is **not a web-based game server panel**.
+
+Tools like PufferPanel or Pterodactyl focus on managing servers through a web UI
+and assume that administrators are available and have panel access.
+
+DGSM solves a different problem:
+
+In many guilds or communities, the server owner is often offline.
+When a server crashes or is stopped, players usually cannot restart it
+without waiting for an admin or requesting RDP / panel access.
+
+DGSM treats **Discord as the primary control plane**:
+
+- Discord is the main interface, not an add-on
+- Role-based access is handled through Discord roles
+- Trusted players can start stopped servers without web panel access
+- No exposed web UI is required
+- Headless operation is fully supported
+
+A local desktop UI exists, but it is optional and uses the same backend logic.
+Discord remains the authoritative control interface by design.
+
+---
+
+
 ## 💖 Support this project
 
 If DGSM saves you time or helps you run your servers, please consider supporting development:
