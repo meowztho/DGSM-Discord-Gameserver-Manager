@@ -87,8 +87,6 @@ From `v2.0.1`, releases can include both:
 - full source code (as before)
 - prebuilt Windows package in `dist/DGSM/`
 
-Detailed changes for this release: [RELEASE_NOTES_v2.0.1.md](RELEASE_NOTES_v2.0.1.md)
-
 Start prebuilt version with:
 
 ```powershell
