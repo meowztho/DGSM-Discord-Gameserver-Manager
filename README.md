@@ -4,7 +4,7 @@
 
 
 Manage and automate your game servers directly from Discord – no remote desktop required.\
-Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons.
+Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons on Windows and new on Linux(untested).
 
 ![Main Bot UI](docs/bot_ui.png)
 
@@ -14,7 +14,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 ## ✨ Features
 
 - Start / Stop / Restart / Status via buttons and slash commands
-- Optional local **Windows Desktop UI**
+- Optional local **Desktop UI** (Windows/Linux)
 - UI-only startup mode if Discord env values are missing
 - Create ZIP backups via `/createbackup`
 - Restore server data from ZIP backups via `/restorebackup`
@@ -24,7 +24,10 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Role & permission checks for admin actions
 - SQLite logging, JSON configuration
 - Automatic SteamCMD download (if missing) into `src/steam/`
-- Runs on Windows servers without RDP
+- Automatic runtime detection for Windows/Linux behavior
+- Runs on Windows and Linux servers
+- Keeps existing templates usable with OS-specific executable fallback
+- Normalized template JSON schema across all `plugin_templates`
 
 ---
 
@@ -32,7 +35,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 1. **Install Python 3.12**\
    [https://www.python.org/downloads/](https://www.python.org/downloads/)\
-   Make sure to check **"Add Python to PATH"** during installation.
+   On Windows, check **"Add Python to PATH"**. On Linux, install `python3` and `pip` via your distro package manager if needed.
 
 2. **Download DGSM**
 
@@ -100,7 +103,7 @@ Runtime paths used by DGSM:
 - `src/server_pids.json`
 - `src/plugin_templates/`
 - `src/steam/`
-- `src/steam/steamcmd.exe`
+- `src/steam/steamcmd.exe` (Windows) or `src/steam/steamcmd.sh` (Linux)
 - `src/steam/GSM/servers/`
 
 ---
@@ -155,9 +158,9 @@ Before running DGSM with a real token, you must create a bot account in the Disc
 
 ---
 
-## 🖥️ Local Windows Desktop UI (Addon)
+## 🖥️ Local Desktop UI (Addon)
 
-DGSM now includes a local desktop control window for Windows.
+DGSM includes a local desktop control window for Windows and Linux (PySide6 required).
 
 - Starts automatically together with the bot
 - Uses **PySide6 (Qt for Python)** with a modern dark Soft-UI style
@@ -167,6 +170,7 @@ DGSM now includes a local desktop control window for Windows.
 - Reflects Discord-side command state changes in the desktop dashboard
 - Settings changed in desktop UI are pushed to Discord status panel refresh
 - Unsaved setting edits stay in the form until you press `SAVE CFG`
+- Linux note: a graphical display/session is required for the UI window (headless servers can use Discord-only mode).
 
 Dependency note:
 
@@ -189,6 +193,8 @@ Optional: hide the separate console window while desktop UI is open:
 ```env
 DGSM_HIDE_CONSOLE_WHEN_UI=true
 ```
+
+Note: `DGSM_HIDE_CONSOLE_WHEN_UI` applies to Windows console behavior.
 
 ---
 
@@ -225,20 +231,29 @@ Some servers require SteamCMD to install or update.
 
 1. DGSM supports these SteamCMD locations:
 
-   - `steam/steamcmd.exe` relative to `Main.py` directory (this is `src/steam/steamcmd.exe` when started from repo root)
+   - `steam/steamcmd.exe` (Windows) or `steam/steamcmd.sh` (Linux) relative to `Main.py`
    - Path from env variable `STEAMCMD_PATH`
    - Any SteamCMD available in your system `PATH`
 
 2. If SteamCMD is not found, DGSM can auto-download it to `src/steam/` using:
 
    - `STEAMCMD_DOWNLOAD_URL` from `src/.env`
-   - default: `https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip`
+   - default (Windows): `https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip`
+   - default (Linux): `https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz`
 
 3. Optional: set `STEAMCMD_PATH` in `src/.env`, for example:
 
    ```env
    STEAMCMD_PATH=C:\\Tools\\SteamCMD\\steamcmd.exe
    ```
+
+   Linux example:
+
+   ```env
+   STEAMCMD_PATH=/opt/steamcmd/steamcmd.sh
+   ```
+
+4. If `STEAMCMD_DOWNLOAD_URL` is empty, DGSM chooses the correct default automatically based on OS.
 
 ---
 
@@ -281,6 +296,7 @@ Fields used by the bot:
 - `log_retention_days`: retention for action logs in SQLite.
 - `server_paths.<name>.app_id`: required Steam AppID.
 - `server_paths.<name>.executable`: optional executable file name.
+  DGSM resolves this OS-aware (for example Linux can auto-try alternatives if template still contains `.exe`).
 - `server_paths.<name>.instance_id`: optional instance folder key. `/addserver` can set this explicitly, otherwise it is generated automatically.
 - `server_paths.<name>.install_dir`: optional custom serverfiles path (absolute or relative to `src/`).
 - `server_paths.<name>.username` / `password`: optional Steam login. Password is encrypted in config.
@@ -289,8 +305,33 @@ Fields used by the bot:
 
 Each template folder normally contains:
 
-- `config.json`: install/update metadata like `app_id`, `executable`, update flags and optional Steam credentials.
+- `config.json`: install/update metadata like `app_id`, update flags and optional Steam credentials.
+  `executable` is optional.
+  Optional OS overrides: `executable_windows` and `executable_linux`.
 - `server_settings.json`: copied into the server instance and used for runtime options.
+  If no executable is configured, DGSM auto-detects a start file after install/start and writes hints back.
+
+Behavior summary:
+
+- If a template comes without `executable`, it is accepted.
+- DGSM automatically detects a suitable start file on Windows/Linux and writes it back as a hint.
+- You can still set `executable_windows` / `executable_linux` explicitly for exact control.
+
+Template schema (normalized):
+
+```json
+{
+  "app_id": "2394010",
+  "executable": "PalServer.exe",
+  "executable_windows": "",
+  "executable_linux": "",
+  "auto_update": true,
+  "auto_restart": true,
+  "stop_time": "05:00",
+  "restart_after_stop": false,
+  "parameters": []
+}
+```
 
 ### 3. `server_settings.json` per server instance
 
