@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from config_store import load_config, BASE_DIR
+from platform_utils import normalize_user_path
 
 SERVER_PATHS: Dict[str, str] = {}
 SERVER_CONFIGS: Dict[str, dict] = {}
@@ -34,7 +35,7 @@ def server_files_for_entry(name: str, info: dict) -> Path:
 
     install_dir = info.get("install_dir")
     if isinstance(install_dir, str) and install_dir.strip():
-        p = Path(install_dir.strip())
+        p = Path(os.path.expanduser(normalize_user_path(install_dir)))
         if not p.is_absolute():
             p = Path(BASE_DIR) / p
         return p

@@ -1,8 +1,8 @@
-﻿import asyncio
+import asyncio
 import logging
 import os
+import json
 import signal
-import sys
 import subprocess
 from datetime import datetime
 from typing import Dict, List, Optional, Iterable
@@ -12,11 +12,13 @@ from collections import defaultdict
 import psutil
 
 from paths import SERVER_PATHS, SERVER_CONFIGS, load_server_paths, load_server_configs
-from config_store import get_config_value
+from config_store import get_config_value, load_config, save_config
 from db import write_action_log
 from pidcache import save_pids, load_pids
 from runtime_status import begin_operation, end_operation_success, end_operation_failed
 from steam_integration import run_update  # für Auto-Update
+from platform_utils import is_windows, executable_path_variants, normalize_user_path
+from template_utils import normalize_server_settings, with_detected_executable
 
 # Per-Server-Locks gegen Doppelstart/-stop
 server_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -49,26 +51,93 @@ def _resolve_executable(server_name: str) -> Optional[str]:
     if not base:
         return None
 
+    def _resolve_configured_path(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        for variant in executable_path_variants(str(value)):
+            expanded = os.path.expanduser(variant)
+            candidate = expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
     # 1) settings.json
     settings = SERVER_CONFIGS.get(server_name, {})
-    exe_settings = settings.get("executable")
-    if exe_settings:
-        candidate = os.path.join(base, exe_settings)
-        if os.path.isfile(candidate):
-            return candidate
+    preferred_setting_keys = (
+        ("executable_windows", "executable_win", "executable")
+        if is_windows()
+        else ("executable_linux", "executable_unix", "executable")
+    )
+    configured_values: List[Optional[str]] = [settings.get(key) for key in preferred_setting_keys]
 
     # 2) server_config.json
-    exe_config = get_config_value(server_name, "executable")
-    if exe_config:
-        candidate = os.path.join(base, exe_config)
-        if os.path.isfile(candidate):
+    configured_values.append(get_config_value(server_name, "executable"))
+
+    for raw_value in configured_values:
+        candidate = _resolve_configured_path(raw_value)
+        if candidate:
             return candidate
 
-    # 3) heuristische Suche
-    patterns = ["*Server*.exe", "*Dedicated*.exe", "*.exe"]
+    # 2b) Linux: bevorzugt Treffer mit gleichem Stammnamen wie im Template.
+    if not is_windows():
+        for raw_value in configured_values:
+            if not raw_value:
+                continue
+            normalized = normalize_user_path(str(raw_value))
+            stem = os.path.splitext(os.path.basename(normalized))[0].lower()
+            if not stem:
+                continue
+            hits = glob.glob(os.path.join(base, f"{stem}*"))
+            hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+            for hit in hits:
+                if not os.path.isfile(hit):
+                    continue
+                low = os.path.basename(hit).lower()
+                if (
+                    os.access(hit, os.X_OK)
+                    or low.endswith((".sh", ".x86_64", ".run", ".bin"))
+                    or "." not in os.path.basename(hit)
+                ):
+                    return hit
+            hits = glob.glob(os.path.join(base, "**", f"{stem}*"), recursive=True)
+            hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+            for hit in hits:
+                if not os.path.isfile(hit):
+                    continue
+                low = os.path.basename(hit).lower()
+                if (
+                    os.access(hit, os.X_OK)
+                    or low.endswith((".sh", ".x86_64", ".run", ".bin"))
+                    or "." not in os.path.basename(hit)
+                ):
+                    return hit
+
+    # 3) generische heuristische Suche
+    if is_windows():
+        patterns = ["*Server*.exe", "*Dedicated*.exe", "*.exe", "*.bat", "*.cmd"]
+    else:
+        patterns = [
+            "*Server*.x86_64",
+            "*server*.x86_64",
+            "*Dedicated*.x86_64",
+            "*dedicated*.x86_64",
+            "*Server*.sh",
+            "*server*.sh",
+            "*Dedicated*.sh",
+            "*dedicated*.sh",
+            "*Server*",
+            "*server*",
+            "*.sh",
+        ]
     for pat in patterns:
         hits = glob.glob(os.path.join(base, pat))
-        hits.sort(key=lambda p: (("server" not in p.lower()), len(p)))
+        hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+        for h in hits:
+            if os.path.isfile(h):
+                return h
+    for pat in patterns:
+        hits = glob.glob(os.path.join(base, "**", pat), recursive=True)
+        hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
         for h in hits:
             if os.path.isfile(h):
                 return h
@@ -83,7 +152,82 @@ def _server_command(server_name: str) -> Optional[List[str]]:
     if not exe_path:
         return None
     params = _normalize_params(SERVER_CONFIGS.get(server_name, {}).get("parameters", []))
+    if not is_windows() and exe_path.lower().endswith(".sh") and not os.access(exe_path, os.X_OK):
+        return ["sh", exe_path] + params
     return [exe_path] + params
+
+
+def discover_executable_for_server(server_name: str) -> Optional[str]:
+    """
+    Resolves an executable for a server and returns a path relative to server root
+    when possible, otherwise an absolute path.
+    """
+    base = SERVER_PATHS.get(server_name)
+    if not base:
+        return None
+    exe_path = _resolve_executable(server_name)
+    if not exe_path:
+        return None
+    try:
+        base_abs = os.path.abspath(base)
+        exe_abs = os.path.abspath(exe_path)
+        if os.path.commonpath([base_abs, exe_abs]) == base_abs:
+            rel = os.path.relpath(exe_abs, base_abs)
+            return normalize_user_path(rel)
+    except Exception:
+        pass
+    return exe_path
+
+
+def ensure_server_executable_hint(server_name: str) -> Optional[str]:
+    """
+    If executable fields are missing, auto-fill them from detected files.
+    """
+    detected = discover_executable_for_server(server_name)
+    if not detected:
+        return None
+
+    changed_cfg = False
+    changed_settings = False
+
+    cfg = load_config()
+    entry = cfg.get("server_paths", {}).get(server_name)
+    if isinstance(entry, dict):
+        current = str(entry.get("executable", "") or "").strip()
+        if not current:
+            entry["executable"] = detected
+            changed_cfg = True
+
+    base = SERVER_PATHS.get(server_name)
+    if base:
+        settings_file = os.path.join(base, "server_settings.json")
+        raw_settings = {}
+        if os.path.isfile(settings_file):
+            try:
+                with open(settings_file, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    raw_settings = loaded
+            except Exception:
+                raw_settings = {}
+
+        old_norm = normalize_server_settings(raw_settings)
+        new_norm = with_detected_executable(old_norm, detected)
+        merged_settings = dict(raw_settings)
+        for key, value in new_norm.items():
+            merged_settings[key] = value
+        if merged_settings != raw_settings or not os.path.isfile(settings_file):
+            with open(settings_file, "w", encoding="utf-8") as handle:
+                json.dump(merged_settings, handle, indent=4)
+            changed_settings = True
+
+    if changed_cfg:
+        save_config(cfg)
+    if changed_cfg or changed_settings:
+        load_server_paths()
+        load_server_configs()
+
+    return detected
 
 
 async def auto_update_if_enabled(server_name: str):
@@ -122,7 +266,7 @@ async def start_server(server_name: str) -> bool:
 
             cmd = _server_command(server_name)
             if not cmd:
-                fail_reason = f"Exe nicht gefunden in {SERVER_PATHS.get(server_name)}"
+                fail_reason = f"Startdatei nicht gefunden in {SERVER_PATHS.get(server_name)}"
                 write_action_log("start", server_name, "failed", fail_reason)
                 logging.error(f"[START] {server_name}: {fail_reason}")
                 return False
@@ -131,7 +275,7 @@ async def start_server(server_name: str) -> bool:
                 proc = subprocess.Popen(
                     cmd,
                     cwd=SERVER_PATHS[server_name],
-                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0),
+                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if is_windows() else 0),
                 )
                 server_processes[server_name] = psutil.Process(proc.pid)
                 save_pids(server_processes)
@@ -242,7 +386,7 @@ async def stop_server(server_name: str) -> bool:
                     except psutil.NoSuchProcess:
                         proc = None
 
-                if proc and sys.platform == "win32":
+                if proc and is_windows():
                     # CTRL_BREAK NUR für eigene Kinder
                     is_child = (proc.ppid() == os.getpid())
                     if is_child:
@@ -266,7 +410,7 @@ async def stop_server(server_name: str) -> bool:
                         # taskkill-Baum für den Hauptprozess
                         await _terminate_tree_windows([proc.pid])
 
-                elif proc and sys.platform != "win32":
+                elif proc and not is_windows():
                     try:
                         proc.terminate()
                         if await _wait_gone(proc, timeout=10):
@@ -282,7 +426,7 @@ async def stop_server(server_name: str) -> bool:
                         await _wait_gone(proc, timeout=5)
 
                 # --- Jetzt alle übrigen "verlorenen" Prozesse im Serverordner killen ---
-                if sys.platform == "win32":
+                if is_windows():
                     await _terminate_tree_windows([p.pid for p in related])
                 else:
                     for p in related:
@@ -325,7 +469,7 @@ async def stop_server(server_name: str) -> bool:
 
             except Exception as e:
                 # Letzter Versuch auf Windows: Full force
-                if sys.platform == "win32":
+                if is_windows():
                     try:
                         if proc:
                             await _win_taskkill(proc.pid, force=True)

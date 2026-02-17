@@ -1,5 +1,7 @@
 {
     "executable": "PalServer.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "-EpicApp=PalServer",
         "-useperfthreads",
