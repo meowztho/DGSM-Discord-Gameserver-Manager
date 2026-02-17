@@ -7,6 +7,29 @@
 Manage and automate your game servers directly from Discord – no remote desktop required.\
 Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons on Windows and new on Linux(untested).
 
+## Table of Contents
+
+- [DGSM – Discord Gameserver Manager](#dgsm--discord-gameserver-manager)
+  - [Features](#-features)
+  - [Project Scope & Design Philosophy](#project-scope--design-philosophy)
+  - [Installation](#-installation)
+  - [Release Package (Code + Dist)](#-release-package-code--dist)
+  - [Discord Bot Setup](#️-discord-bot-setup)
+  - [Local Desktop UI (Addon)](#️-local-desktop-ui-addon)
+  - [Build Windows EXE](#️-build-windows-exe)
+  - [Screenshots](#-screenshots)
+  - [SteamCMD Setup](#-steamcmd-setup)
+  - [Backup & Restore](#-backup--restore)
+  - [Configuration File Reference](#configuration-file-reference)
+    - [`server_config.json`](#1-srcserver_configjson)
+    - [`plugin_templates`](#2-srcplugin_templates)
+    - [`server_settings.json`](#3-server_settingsjson-per-server-instance)
+  - [FAQ](#faq)
+  - [Support this Project](#-support-this-project)
+  - [License](#-license)
+
+
+
 ![Main Bot UI](docs/bot_ui.png)
 
 <img src="docs/GUI..png" alt="Main Bot UI" width="75%">
