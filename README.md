@@ -9,6 +9,8 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 ## Table of Contents
 
+---
+
 - [DGSM – Discord Gameserver Manager](#dgsm--discord-gameserver-manager)
   - [Features](#-features)
   - [Project Scope & Design Philosophy](#project-scope--design-philosophy)
@@ -27,7 +29,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
   - [Support this Project](#-support-this-project)
   - [License](#-license)
 
-
+---
 
 ![Main Bot UI](docs/bot_ui.png)
 
