@@ -1,4 +1,5 @@
 # DGSM – Discord Gameserver Manager
+## for Windows and Linux(untested).
 
 ![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
 
