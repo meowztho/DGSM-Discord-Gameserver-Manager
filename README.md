@@ -24,7 +24,6 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
     - [`server_config.json`](#1-srcserver_configjson)
     - [`plugin_templates`](#2-srcplugin_templates)
     - [`server_settings.json`](#3-server_settingsjson-per-server-instance)
-  - [FAQ](#faq)
   - [Support this Project](#-support-this-project)
   - [License](#-license)
 
