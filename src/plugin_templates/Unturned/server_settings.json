@@ -1,4 +1,7 @@
 {
+    "executable": "Unturned.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "-server"
     ],

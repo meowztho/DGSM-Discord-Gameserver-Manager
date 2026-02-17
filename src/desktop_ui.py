@@ -27,9 +27,16 @@ from runtime_status import (
     end_operation_success,
     get_operation_status,
 )
-from server_manager import server_processes, start_server, stop_server
+from server_manager import server_processes, start_server, stop_server, ensure_server_executable_hint
 from steam_integration import run_update
 from security import encrypt_value
+from template_utils import (
+    build_template_config,
+    read_template_config,
+    template_effective_executable,
+    template_settings_from_config,
+    write_template_files,
+)
 
 try:
     import psutil
@@ -1179,8 +1186,6 @@ async def _create_template_action(
         return False, "Template name required"
     if not app_id.strip():
         return False, "Steam App ID required"
-    if not executable.strip():
-        return False, "Executable required"
 
     stop = str(stop_time or "").strip()
     if stop and not _STOP_TIME_RE.match(stop):
@@ -1194,35 +1199,18 @@ async def _create_template_action(
 
     try:
         template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template_name.strip())
-        os.makedirs(template_dir, exist_ok=True)
-        config = {
-            "app_id": app_id.strip(),
-            "executable": executable.strip(),
-            "auto_update": bool(auto_update),
-            "auto_restart": bool(auto_restart),
-            "stop_time": stop,
-            "restart_after_stop": bool(restart_after_stop),
-            "parameters": param_list,
-        }
-        if username.strip() and password.strip():
-            config["username"] = username.strip()
-            config["password"] = password.strip()
-
-        with open(os.path.join(template_dir, "config.json"), "w", encoding="utf-8") as handle:
-            json.dump(config, handle, indent=4)
-        with open(os.path.join(template_dir, "server_settings.json"), "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "executable": executable.strip(),
-                    "parameters": param_list,
-                    "auto_update": bool(auto_update),
-                    "auto_restart": bool(auto_restart),
-                    "stop_time": stop,
-                    "restart_after_stop": bool(restart_after_stop),
-                },
-                handle,
-                indent=4,
-            )
+        cfg = build_template_config(
+            app_id=app_id.strip(),
+            executable=executable.strip(),
+            parameters=param_list,
+            auto_update=bool(auto_update),
+            auto_restart=bool(auto_restart),
+            stop_time=stop,
+            restart_after_stop=bool(restart_after_stop),
+            username=username.strip(),
+            password=password.strip(),
+        )
+        write_template_files(template_dir, cfg)
         write_action_log("ui_createtemplate", name, "success", f"app_id={app_id.strip()}")
         _schedule_discord_refresh()
         return True, f"Template '{template_name.strip()}' saved"
@@ -1249,13 +1237,13 @@ async def _add_server_action(
         cfg_path = os.path.join(template_dir, "config.json")
         if not os.path.isfile(cfg_path):
             return False, "Template config.json not found"
-        with open(cfg_path, "r", encoding="utf-8") as handle:
-            tcfg = json.load(handle)
+        tcfg = read_template_config(template_dir)
+        write_template_files(template_dir, tcfg)
 
         app_id = str(tcfg.get("app_id", "")).strip()
-        executable = str(tcfg.get("executable", "")).strip()
-        if not app_id or not executable:
-            return False, "Template missing app_id/executable"
+        executable = template_effective_executable(tcfg)
+        if not app_id:
+            return False, "Template missing app_id"
 
         cfg = load_config()
         if server_name in cfg.get("server_paths", {}):
@@ -1281,18 +1269,13 @@ async def _add_server_action(
             else:
                 shutil.copy2(src, dst)
 
-        settings = {
-            "executable": executable,
-            "parameters": tcfg.get("parameters", []),
-            "auto_update": tcfg.get("auto_update", True),
-            "auto_restart": tcfg.get("auto_restart", True),
-            "stop_time": tcfg.get("stop_time", "05:00"),
-            "restart_after_stop": tcfg.get("restart_after_stop", False),
-        }
+        settings = template_settings_from_config(tcfg)
         with open(os.path.join(server_dir, "server_settings.json"), "w", encoding="utf-8") as handle:
             json.dump(settings, handle, indent=4)
 
-        entry = {"app_id": app_id, "executable": executable, "instance_id": chosen}
+        entry = {"app_id": app_id, "instance_id": chosen}
+        if executable:
+            entry["executable"] = executable
         if tcfg.get("username") and tcfg.get("password"):
             entry["username"] = str(tcfg["username"])
             entry["password"] = encrypt_value(str(tcfg["password"]))
@@ -1307,6 +1290,7 @@ async def _add_server_action(
             _schedule_discord_refresh()
             return False, f"Install failed: {msg_update}"
 
+        await asyncio.to_thread(ensure_server_executable_hint, server_name)
         if start_after_install:
             ok_start = await start_server(server_name)
             if not ok_start:
@@ -2556,8 +2540,8 @@ if QApplication is not None:
             app_id, ok = QInputDialog.getText(self, "Create Template", "Steam App ID:")
             if not ok or not str(app_id).strip():
                 return
-            executable, ok = QInputDialog.getText(self, "Create Template", "Executable:")
-            if not ok or not str(executable).strip():
+            executable, ok = QInputDialog.getText(self, "Create Template", "Executable (optional):")
+            if not ok:
                 return
             params, ok = QInputDialog.getText(self, "Create Template", "Parameters (optional):")
             if not ok:
@@ -2922,9 +2906,6 @@ def start_desktop_ui(
 ) -> bool:
     global _LOOP, _REFRESH_CALLBACK, _STARTED
 
-    if os.name != "nt":
-        logging.info("[DESKTOP-UI] not started (Windows only)")
-        return False
     if not _env_bool("DGSM_DESKTOP_UI_ENABLED", True):
         logging.info("[DESKTOP-UI] disabled via DGSM_DESKTOP_UI_ENABLED")
         return False

@@ -1,7 +1,9 @@
 {
     "executable": "jre\\bin\\java.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
-		"-XX:+UnlockExperimentalVMOptions",
+        "-XX:+UnlockExperimentalVMOptions",
         "-XX:+UseG1GC",
         "-XX:+ExplicitGCInvokesConcurrent",
         "-XX:G1NewSizePercent=20",
@@ -14,9 +16,9 @@
         "-world",
         "Survival2025",
         "-pausewhenempty"
-		],
+    ],
     "auto_update": true,
-    "auto_restart": false,
+    "auto_restart": true,
     "stop_time": "05:00",
     "restart_after_stop": false
 }

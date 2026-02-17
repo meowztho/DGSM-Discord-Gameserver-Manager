@@ -1,5 +1,7 @@
 {
     "executable": "CoreKeeperServer.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "-batchmode",
         "-nographics",

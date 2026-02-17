@@ -1,5 +1,7 @@
 {
     "executable": "StarRuptureServerEOS.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "-log",
         "-port=7777"
@@ -8,5 +10,4 @@
     "auto_restart": true,
     "stop_time": "05:00",
     "restart_after_stop": false
-
 }

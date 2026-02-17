@@ -1,6 +1,8 @@
 {
     "app_id": "2394010",
     "executable": "PalServer.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "auto_update": true,
     "auto_restart": true,
     "stop_time": "05:02",

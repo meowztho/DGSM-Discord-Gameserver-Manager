@@ -33,9 +33,17 @@ from paths import (
 )
 from db import write_action_log
 from ui import refresh_status_panel
-from server_manager import start_server, stop_server, server_processes
+from server_manager import start_server, stop_server, server_processes, ensure_server_executable_hint
 from steam_integration import run_update, run_update_with_credentials, get_steamcmd_resolution
 from context import CHANNEL, safe_get_ip
+from platform_utils import runtime_platform_label
+from template_utils import (
+    build_template_config,
+    read_template_config,
+    template_effective_executable,
+    template_settings_from_config,
+    write_template_files,
+)
 from runtime_status import (
     begin_operation,
     end_operation_success,
@@ -472,7 +480,16 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
         "stop_time",
         "restart_after_stop",
     ]
-    all_settings_keys = ["executable", "parameters", "auto_update", "auto_restart", "stop_time", "restart_after_stop"]
+    all_settings_keys = [
+        "executable",
+        "executable_windows",
+        "executable_linux",
+        "parameters",
+        "auto_update",
+        "auto_restart",
+        "stop_time",
+        "restart_after_stop",
+    ]
     try:
         if section == "config":
             cfg = load_config()
@@ -535,6 +552,7 @@ async def diag(ctx: discord.ApplicationContext):
 
         message = (
             "**DGSM Diagnose**\n"
+            f"- Plattform: `{runtime_platform_label()}`\n"
             f"- Config: `{CONFIG_PATH}`\n"
             f"- Logs DB: `{DB_PATH}`\n"
             f"- SteamCMD: `{steamcmd_path or 'nicht gefunden'}`\n"
@@ -557,7 +575,7 @@ async def create_template(
     ctx: discord.ApplicationContext,
     template_name: str,
     app_id: str,
-    executable: str,
+    executable: Option(str, "Server executable (optional)", required=False, default=""),
     parameters: Option(str, "Startparameter (z.B. -port=25565 -maxplayers=20)", required=False),
     auto_update: Option(bool, "Automatische Updates aktivieren", default=True),
     auto_restart: Option(bool, "Automatischer Neustart bei Absturz", default=True),
@@ -570,30 +588,18 @@ async def create_template(
     try:
         param_list = shlex.split(parameters) if parameters else []
         template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template_name)
-        os.makedirs(template_dir, exist_ok=True)
-        config = {
-            "app_id": app_id,
-            "executable": executable,
-            "auto_update": auto_update,
-            "auto_restart": auto_restart,
-            "stop_time": stop_time,
-            "restart_after_stop": restart_after_stop,
-            "parameters": param_list,
-        }
-        if username and password:
-            config["username"] = username
-            config["password"] = password
-        with open(os.path.join(template_dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
-        with open(os.path.join(template_dir, "server_settings.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "executable": executable,
-                "parameters": param_list,
-                "auto_update": auto_update,
-                "auto_restart": auto_restart,
-                "stop_time": stop_time,
-                "restart_after_stop": restart_after_stop,
-            }, f, indent=4)
+        cfg = build_template_config(
+            app_id=app_id,
+            executable=executable or "",
+            parameters=param_list,
+            auto_update=auto_update,
+            auto_restart=auto_restart,
+            stop_time=stop_time,
+            restart_after_stop=restart_after_stop,
+            username=username or "",
+            password=password or "",
+        )
+        write_template_files(template_dir, cfg)
         await safe_send(ctx, f"✅ Template '{template_name}' erstellt/aktualisiert.", ephemeral=True)
     except Exception as e:
         await safe_send(ctx, f"❌ Fehler: {e}", ephemeral=True)
@@ -616,18 +622,17 @@ async def add_server(
         cfg_path = os.path.join(template_dir, "config.json")
         if not os.path.exists(cfg_path):
             return await safe_send(ctx, f"❌ Template '{template}' hat keine config.json!", ephemeral=True)
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            tcfg = json.load(f)
-        for req in ("app_id", "executable"):
-            if req not in tcfg:
-                return await safe_send(ctx, f"❌ Template unvollständig. Fehlend: {req}", ephemeral=True)
+        tcfg = read_template_config(template_dir)
+        write_template_files(template_dir, tcfg)
+        if not str(tcfg.get("app_id", "")).strip():
+            return await safe_send(ctx, "❌ Template unvollständig. Fehlend: app_id", ephemeral=True)
 
         cfg = load_config()
         if name in cfg["server_paths"]:
             return await safe_send(ctx, f"Server '{name}' existiert bereits.", ephemeral=True)
 
         app_id = str(tcfg["app_id"])
-        executable = tcfg["executable"]
+        executable = template_effective_executable(tcfg)
         if instance_id:
             chosen_instance_id = sanitize_instance_id(instance_id)
             if _instance_id_exists(cfg, app_id, chosen_instance_id):
@@ -656,18 +661,13 @@ async def add_server(
                 from shutil import copy2
                 copy2(src, dst)
 
-        s_settings = {
-            "executable": executable,
-            "parameters": tcfg.get("parameters", []),
-            "auto_update": tcfg.get("auto_update", True),
-            "auto_restart": tcfg.get("auto_restart", True),
-            "stop_time": tcfg.get("stop_time", "05:00"),
-            "restart_after_stop": tcfg.get("restart_after_stop", False),
-        }
+        s_settings = template_settings_from_config(tcfg)
         with open(os.path.join(server_dir, "server_settings.json"), "w", encoding="utf-8") as f:
             json.dump(s_settings, f, indent=4)
 
-        entry = {"app_id": app_id, "executable": executable, "instance_id": instance_id}
+        entry = {"app_id": app_id, "instance_id": instance_id}
+        if executable:
+            entry["executable"] = executable
         if tcfg.get("username") and tcfg.get("password"):
             entry["username"] = tcfg["username"]
             entry["password"] = encrypt_value(tcfg["password"])
@@ -716,6 +716,7 @@ async def add_server(
             await refresh_main_panel()
             return
 
+        await asyncio.to_thread(ensure_server_executable_hint, name)
         await safe_send(ctx, f"✅ Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
         if not await start_server(name):
             write_action_log("start_after_add", name, "failed")

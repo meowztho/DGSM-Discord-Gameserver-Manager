@@ -1,5 +1,7 @@
 {
     "executable": "enshrouded_server.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [],
     "auto_update": true,
     "auto_restart": true,

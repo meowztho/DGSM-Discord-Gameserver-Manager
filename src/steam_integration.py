@@ -1,44 +1,64 @@
-﻿import asyncio
+import asyncio
 import glob
 import logging
 import os
 import shutil
+import tarfile
 import time as time_lib
 import urllib.request
 import zipfile
 from collections import defaultdict
 from typing import Dict, Tuple, Optional, List
+from urllib.parse import urlparse
 
 from config_store import BASE_DIR, STEAM_SESSIONS_DIR
 from config_store import load_config
 from config_store import get_config_value
 import paths  # wichtig: Modul importieren, nicht einzelne Variablen
+from platform_utils import is_windows, is_linux, normalize_user_path, executable_path_variants
 from runtime_status import begin_operation, end_operation_success, end_operation_failed
 
 # ----------------------------
 # Konfiguration
 # ----------------------------
 DEFAULT_TIMEOUT = int(os.getenv("STEAMCMD_TIMEOUT", "7200"))  # 2h Default
-DEFAULT_STEAMCMD_DOWNLOAD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+DEFAULT_STEAMCMD_DOWNLOAD_URL_WINDOWS = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+DEFAULT_STEAMCMD_DOWNLOAD_URL_LINUX = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
 _UPDATE_LOCKS: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _steamcmd_candidate_names() -> List[str]:
+    if is_windows():
+        return ["steamcmd.exe", "steamcmd", "steamcmd.sh"]
+    return ["steamcmd.sh", "steamcmd", "steamcmd.exe"]
+
+
+def _default_steamcmd_download_url() -> str:
+    if is_windows():
+        return DEFAULT_STEAMCMD_DOWNLOAD_URL_WINDOWS
+    if is_linux():
+        return DEFAULT_STEAMCMD_DOWNLOAD_URL_LINUX
+    return DEFAULT_STEAMCMD_DOWNLOAD_URL_WINDOWS
 
 
 def _resolve_steamcmd() -> Tuple[Optional[str], str]:
     default_dir = os.path.join(BASE_DIR, "steam")
     candidates: List[str] = []
 
-    env_path = (os.getenv("STEAMCMD_PATH") or "").strip().strip('"').strip("'")
-    if env_path:
+    env_path_raw = (os.getenv("STEAMCMD_PATH") or "").strip().strip('"').strip("'")
+    if env_path_raw:
+        env_path = os.path.expanduser(normalize_user_path(env_path_raw))
         if os.path.isdir(env_path):
-            candidates.append(os.path.join(env_path, "steamcmd.exe"))
-            candidates.append(os.path.join(env_path, "steamcmd"))
+            for cmd_name in _steamcmd_candidate_names():
+                candidates.append(os.path.join(env_path, cmd_name))
         else:
-            candidates.append(env_path)
+            for variant in executable_path_variants(env_path):
+                candidates.append(os.path.expanduser(variant))
 
-    candidates.append(os.path.join(default_dir, "steamcmd.exe"))
-    candidates.append(os.path.join(default_dir, "steamcmd"))
+    for cmd_name in _steamcmd_candidate_names():
+        candidates.append(os.path.join(default_dir, cmd_name))
 
-    for cmd_name in ("steamcmd.exe", "steamcmd"):
+    for cmd_name in _steamcmd_candidate_names():
         found = shutil.which(cmd_name)
         if found:
             candidates.append(found)
@@ -47,79 +67,60 @@ def _resolve_steamcmd() -> Tuple[Optional[str], str]:
         if not candidate:
             continue
         if os.path.isabs(candidate):
-            if os.path.exists(candidate):
+            if os.path.isfile(candidate):
                 return candidate, os.path.dirname(candidate)
         else:
             found = shutil.which(candidate)
             if found:
                 return found, os.path.dirname(found)
-            if os.path.exists(candidate):
+            if os.path.isfile(candidate):
                 abs_path = os.path.abspath(candidate)
                 return abs_path, os.path.dirname(abs_path)
 
     return None, default_dir
 
 
-def _env_file_path() -> str:
-    return os.path.join(BASE_DIR, ".env")
-
-
-def _upsert_env_value(key: str, value: str) -> None:
-    env_path = _env_file_path()
-    lines: List[str] = []
-    found = False
-
-    if os.path.isfile(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as handle:
-                lines = handle.read().splitlines()
-        except Exception:
-            lines = []
-
-    for idx, line in enumerate(lines):
-        if line.strip().startswith(f"{key}="):
-            lines[idx] = f"{key}={value}"
-            found = True
-            break
-    if not found:
-        lines.append(f"{key}={value}")
-
-    try:
-        with open(env_path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines).rstrip() + "\n")
-    except Exception:
-        logging.exception("SteamCMD env update failed for %s", key)
-
-
 def _steamcmd_download_url() -> str:
-    key = "STEAMCMD_DOWNLOAD_URL"
-    url = (os.getenv(key) or "").strip()
-    if not url:
-        url = DEFAULT_STEAMCMD_DOWNLOAD_URL
-        os.environ[key] = url
-        _upsert_env_value(key, url)
-    return url
+    url = (os.getenv("STEAMCMD_DOWNLOAD_URL") or "").strip()
+    if url:
+        return url
+    return _default_steamcmd_download_url()
 
 
 def _download_and_extract_steamcmd(target_dir: str, url: str) -> None:
     os.makedirs(target_dir, exist_ok=True)
-    archive_path = os.path.join(target_dir, "steamcmd.zip")
+    parsed_name = os.path.basename(urlparse(url).path)
+    archive_name = parsed_name or ("steamcmd.zip" if is_windows() else "steamcmd_linux.tar.gz")
+    archive_path = os.path.join(target_dir, archive_name)
     tmp_path = archive_path + ".part"
 
     with urllib.request.urlopen(url, timeout=120) as response, open(tmp_path, "wb") as out:
         shutil.copyfileobj(response, out, length=1024 * 1024)
     os.replace(tmp_path, archive_path)
 
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        archive.extractall(target_dir)
+    lower_name = archive_name.lower()
+    if lower_name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            archive.extractall(target_dir)
+    elif lower_name.endswith((".tar.gz", ".tgz", ".tar")):
+        with tarfile.open(archive_path, "r:*") as archive:
+            archive.extractall(target_dir)
+    else:
+        # Fallback: erst zip, dann tar versuchen.
+        try:
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                archive.extractall(target_dir)
+        except zipfile.BadZipFile:
+            with tarfile.open(archive_path, "r:*") as archive:
+                archive.extractall(target_dir)
 
     try:
         os.remove(archive_path)
     except Exception:
         pass
 
-    if os.name != "nt":
-        for name in ("steamcmd.sh", "steamcmd"):
+    if not is_windows():
+        for name in ("steamcmd.sh", "steamcmd", os.path.join("linux32", "steamcmd")):
             p = os.path.join(target_dir, name)
             if os.path.isfile(p):
                 try:
@@ -133,8 +134,9 @@ def ensure_steamcmd_available() -> Tuple[bool, str]:
     if steamcmd:
         return True, f"SteamCMD found: {steamcmd}"
 
-    env_path = (os.getenv("STEAMCMD_PATH") or "").strip().strip('"').strip("'")
-    if env_path:
+    env_path_raw = (os.getenv("STEAMCMD_PATH") or "").strip().strip('"').strip("'")
+    if env_path_raw:
+        env_path = os.path.expanduser(normalize_user_path(env_path_raw))
         return False, f"SteamCMD not found at STEAMCMD_PATH='{env_path}'"
 
     url = _steamcmd_download_url()
@@ -160,6 +162,12 @@ def _steam_runtime_dir() -> str:
     if steamcmd:
         return os.path.dirname(steamcmd)
     return steam_dir
+
+
+def _steamcmd_base_command(steamcmd_path: str) -> List[str]:
+    if not is_windows() and steamcmd_path.lower().endswith(".sh") and not os.access(steamcmd_path, os.X_OK):
+        return ["sh", steamcmd_path]
+    return [steamcmd_path]
 
 
 # ----------------------------
@@ -197,14 +205,68 @@ def restore_steam_session(server_name: str) -> bool:
 # Post-Install-Checks
 # ----------------------------
 def _find_executable_in_dir(install_dir: str, preferred: Optional[str]) -> Optional[str]:
-    """Bevorzugt 'preferred', sonst heuristische Suche nach *Server*.exe, *Dedicated*.exe, *.exe"""
+    """Bevorzugt 'preferred', sonst heuristische Suche nach plausiblen Startdateien."""
     if preferred:
-        direct = os.path.join(install_dir, preferred)
-        if os.path.isfile(direct):
-            return direct
-    patterns = ["*Server*.exe", "*Dedicated*.exe", "*.exe"]
+        for variant in executable_path_variants(preferred):
+            normalized = os.path.expanduser(variant)
+            direct = normalized if os.path.isabs(normalized) else os.path.join(install_dir, normalized)
+            if os.path.isfile(direct):
+                return direct
+
+        # Template-Kompatibilität: z. B. "PalServer.exe" -> "PalServer-Linux-*" erkennen.
+        if is_linux():
+            raw = normalize_user_path(preferred)
+            stem = os.path.splitext(os.path.basename(raw))[0].lower()
+            if stem:
+                prefix_hits = glob.glob(os.path.join(install_dir, f"{stem}*"))
+                prefix_hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+                for hit in prefix_hits:
+                    if not os.path.isfile(hit):
+                        continue
+                    low = os.path.basename(hit).lower()
+                    if (
+                        os.access(hit, os.X_OK)
+                        or low.endswith((".sh", ".x86_64", ".run", ".bin"))
+                        or "." not in os.path.basename(hit)
+                    ):
+                        return hit
+                prefix_hits = glob.glob(os.path.join(install_dir, "**", f"{stem}*"), recursive=True)
+                prefix_hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+                for hit in prefix_hits:
+                    if not os.path.isfile(hit):
+                        continue
+                    low = os.path.basename(hit).lower()
+                    if (
+                        os.access(hit, os.X_OK)
+                        or low.endswith((".sh", ".x86_64", ".run", ".bin"))
+                        or "." not in os.path.basename(hit)
+                    ):
+                        return hit
+
+    if is_windows():
+        patterns = ["*Server*.exe", "*Dedicated*.exe", "*.exe", "*.bat", "*.cmd"]
+    else:
+        patterns = [
+            "*Server*.x86_64",
+            "*server*.x86_64",
+            "*Dedicated*.x86_64",
+            "*dedicated*.x86_64",
+            "*Server*.sh",
+            "*server*.sh",
+            "*Dedicated*.sh",
+            "*dedicated*.sh",
+            "*Server*",
+            "*server*",
+            "*.sh",
+        ]
     for pat in patterns:
         hits = glob.glob(os.path.join(install_dir, pat))
+        hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
+        for h in hits:
+            if os.path.isfile(h):
+                return h
+    for pat in patterns:
+        hits = glob.glob(os.path.join(install_dir, "**", pat), recursive=True)
         hits.sort(key=lambda p: (("server" not in os.path.basename(p).lower()), len(p)))
         for h in hits:
             if os.path.isfile(h):
@@ -213,7 +275,7 @@ def _find_executable_in_dir(install_dir: str, preferred: Optional[str]) -> Optio
 
 
 def _install_looks_good(server_name: str, install_dir: str) -> bool:
-    """Ordner hat Dateien und eine plausible EXE ist auffindbar."""
+    """Ordner hat Dateien und eine plausible Startdatei ist auffindbar."""
     try:
         total = 0
         for _, _, files in os.walk(install_dir):
@@ -244,6 +306,28 @@ def _is_known_fatal_update_state(output: str) -> bool:
     if "state is 0x606" in low:
         return True
     return ("error! app '" in low) and ("after update job" in low)
+
+
+def _linux_steamcmd_dependency_hint(output: str) -> Optional[str]:
+    if not is_linux():
+        return None
+    low = (output or "").lower()
+    markers = (
+        "linux32/steamcmd: cannot execute: required file not found",
+        "error while loading shared libraries",
+        "no such file or directory",
+        "wrong elf class",
+    )
+    if not any(marker in low for marker in markers):
+        return None
+    return (
+        "SteamCMD kann unter Linux nicht starten (meist fehlende 32-bit Laufzeitbibliotheken).\n"
+        "Installiere in WSL/Ubuntu typischerweise:\n"
+        "sudo dpkg --add-architecture i386\n"
+        "sudo apt update\n"
+        "sudo apt install -y libc6:i386 libstdc++6:i386 libgcc-s1:i386 lib32gcc-s1 lib32stdc++6 ca-certificates\n"
+        "Danach DGSM/Update erneut starten."
+    )
 
 
 # ----------------------------
@@ -291,7 +375,7 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
                     fail_reason = "SteamCMD nicht gefunden (nach Auto-Download)"
                     return False, fail_reason
 
-            cmd: List[str] = [steamcmd, "+force_install_dir", install_dir]
+            cmd: List[str] = _steamcmd_base_command(steamcmd) + ["+force_install_dir", install_dir]
             if user and pw:
                 cmd.extend(["+login", user, pw])
             else:
@@ -324,6 +408,11 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
                         "SteamCMD meldet blockierten/parallelen Update-Job "
                         "(z. B. state 0x606). Bitte später erneut versuchen."
                     )
+                    return False, fail_reason
+
+                dep_hint = _linux_steamcmd_dependency_hint(output)
+                if dep_hint:
+                    fail_reason = dep_hint
                     return False, fail_reason
 
                 if _install_looks_good(server_name, install_dir) and _output_has_success_marker(output):
@@ -404,10 +493,10 @@ async def run_update_with_credentials(server_name: str, username: str, password:
                 BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
             )
 
-            cmd = [
-                steamcmd, "+force_install_dir", install_dir,
+            cmd = _steamcmd_base_command(steamcmd) + [
+                "+force_install_dir", install_dir,
                 "+login", username, password,
-                "+app_update", str(app_id), "validate", "+quit"
+                "+app_update", str(app_id), "validate", "+quit",
             ]
 
             start_time = time_lib.time()
@@ -436,6 +525,11 @@ async def run_update_with_credentials(server_name: str, username: str, password:
                         "SteamCMD meldet blockierten/parallelen Update-Job "
                         "(z. B. state 0x606). Bitte später erneut versuchen."
                     )
+                    return False, fail_reason
+
+                dep_hint = _linux_steamcmd_dependency_hint(output)
+                if dep_hint:
+                    fail_reason = dep_hint
                     return False, fail_reason
 
                 if _install_looks_good(server_name, install_dir) and _output_has_success_marker(output):
