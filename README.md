@@ -26,6 +26,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
     - [`server_config.json`](#1-srcserver_configjson)
     - [`plugin_templates`](#2-srcplugin_templates)
     - [`server_settings.json`](#3-server_settingsjson-per-server-instance)
+  - [FAQ](#faq)
   - [Support this Project](#-support-this-project)
   - [License](#-license)
 
@@ -393,6 +394,37 @@ DGSM treats **Discord as the primary control plane**:
 
 A local desktop UI exists, but it is optional and uses the same backend logic.
 Discord remains the authoritative control interface by design.
+
+---
+
+## FAQ
+
+### Why not use an existing panel like PufferPanel or Pterodactyl?
+Those panels are web-UI–centric and designed for administrators.
+DGSM focuses on Discord-first workflows where trusted players
+can start or manage servers without panel access.
+
+### Is DGSM a replacement for web-based panels?
+No. DGSM targets a different use case.
+It complements environments where Discord is already the main coordination tool.
+
+### Why Discord instead of a web UI?
+Because players are already on Discord.
+DGSM removes the need for RDP sessions, panel logins, or exposing web interfaces.
+
+### Is a local UI required?
+No. The desktop UI is optional.
+DGSM can run fully headless with Discord as the only interface.
+
+### Is Linux supported?
+Linux support has been added recently and works in current tests,
+but it is not yet widely battle-tested.
+Feedback from Linux users is welcome.
+
+### Why are some messages mixed German and English?
+Localization cleanup is planned.
+Functionality currently has priority over full translation consistency.
+
 
 ---
 
