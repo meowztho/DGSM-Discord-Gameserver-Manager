@@ -17,6 +17,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
   - [Installation](#-installation)
   - [Release Package (Code + Dist)](#-release-package-code--dist)
   - [Discord Bot Setup](#️-discord-bot-setup)
+  - [Optional CLI Commands](#️-optional-cli-commands)
   - [Local Desktop UI (Addon)](#️-local-desktop-ui-addon)
   - [Build Windows EXE](#️-build-windows-exe)
   - [Screenshots](#-screenshots)
@@ -40,6 +41,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 ## ✨ Features
 
 - Start / Stop / Restart / Status via buttons and slash commands
+- Optionaler `/cli` Slash-Command für Kommando-Workflow (Discord bleibt Hauptsteuerung)
 - Optional local **Desktop UI** (Windows/Linux)
 - UI-only startup mode if Discord env values are missing
 - Create ZIP backups via `/createbackup`
@@ -182,6 +184,44 @@ Before running DGSM with a real token, you must create a bot account in the Disc
 
 ---
 
+## ⌨️ Optional CLI Commands
+
+DGSM includes an optional command-style control layer that uses the same backend logic as Discord/UI actions.
+
+- Discord remains the primary control path.
+- CLI commands are available via Discord slash command `/cli`.
+- The desktop UI exposes the same CLI commands inside the **Live Log** panel.
+- No arbitrary shell execution is supported; only DGSM management commands are accepted.
+
+Supported commands:
+
+- `help`
+- `list`
+- `status [server]`
+- `start <server>`
+- `stop <server>`
+- `restart <server>`
+- `update <server>`
+- `refresh`
+
+Examples:
+
+```text
+/cli command:"list"
+/cli command:"status Palworld-main"
+/cli command:"restart Palworld-main"
+```
+
+In desktop UI Live Log CLI bar:
+
+```text
+list
+status Palworld-main
+update Palworld-main
+```
+
+---
+
 ## 🖥️ Local Desktop UI (Addon)
 
 DGSM includes a local desktop control window for Windows and Linux (PySide6 required).
@@ -191,6 +231,7 @@ DGSM includes a local desktop control window for Windows and Linux (PySide6 requ
 - Uses the same backend logic as Discord commands
 - Discord stays the main control path
 - Includes card-based server controls and live console output
+- Includes a compact CLI command bar inside the Live Log panel
 - Reflects Discord-side command state changes in the desktop dashboard
 - Settings changed in desktop UI are pushed to Discord status panel refresh
 - Unsaved setting edits stay in the form until you press `SAVE CFG`
