@@ -94,8 +94,9 @@ def install(serverfiles, ctx):
         ctx.log.info("[HYTALE] Downloader beendet (rc=%s)", rc)
 
     # 4) Hytale.zip entpacken -> Server/ + Assets.zip (sauberer Stand)
+    server_dir = os.path.join(serverfiles, "Server")
     if os.path.isfile(hytale_zip):
-        shutil.rmtree(os.path.join(serverfiles, "Server"), ignore_errors=True)
+        shutil.rmtree(server_dir, ignore_errors=True)
         try:
             os.remove(os.path.join(serverfiles, "Assets.zip"))
         except FileNotFoundError:
@@ -104,14 +105,44 @@ def install(serverfiles, ctx):
             pass
         ctx.extract_zip_file(hytale_zip, serverfiles)
 
-    if os.path.isfile(os.path.join(serverfiles, "Server", "HytaleServer.jar")):
+    if os.path.isfile(os.path.join(server_dir, "HytaleServer.jar")):
         return "Hytale installiert/aktualisiert (Server-Dateien vorhanden)"
 
-    # 5) Kein Bundle -> Login noch offen
+    # 5) Kein lauffaehiges Bundle -> als FEHLER melden (raise), damit DGSM den
+    #    Server NICHT startet. Sonst wuerde eine fehlende Jar gestartet, sofort
+    #    sterben und per auto_restart in einer Endlosschleife neu starten.
+    out = " ".join(auth_lines).lower()
+    tail = " | ".join(l for l in auth_lines[-4:] if l)
+
+    # 5a) Server/ vorhanden, aber Jar heisst anders -> echten Namen melden.
+    if os.path.isdir(server_dir):
+        jars = [f for f in os.listdir(server_dir) if f.lower().endswith(".jar")]
+        if jars:
+            raise RuntimeError(
+                "Hytale-Dateien geladen, aber 'Server/HytaleServer.jar' fehlt. "
+                f"Gefundene Jar(s): {', '.join(jars)}. Bitte den -jar-Parameter im "
+                "Template / in den Server-Settings entsprechend anpassen."
+            )
+
     _write_setup_note(serverfiles, installer_dir, ctx)
-    url = next((l for l in auth_lines if "http" in l.lower()), "")
-    hint = f" Login-URL: {url}" if url else ""
-    return (
-        "Hytale: Java + Downloader bereit, Server-Bundle fehlt noch - Login im "
-        "Browser bestaetigen, dann erneut 'Update' druecken." + hint
-    )
+
+    # 5b) Authentifiziert, aber kein Zugriff auf die Server-Dateien.
+    if ("403" in out) or ("forbidden" in out) or ("error fetching manifest" in out):
+        raise RuntimeError(
+            "Hytale-Login war erfolgreich, aber der Account hat KEINEN Zugriff auf "
+            "die Server-Dateien (HTTP 403 Forbidden). Hytale wurde eingestellt bzw. "
+            "der Account hat keine Server-Download-Berechtigung - es gibt nichts "
+            "herunterzuladen. Downloader: " + tail
+        )
+
+    # 5c) Login noch nicht abgeschlossen.
+    verify = next((l for l in auth_lines if "device/verify" in l.lower()), "")
+    if not os.path.isfile(creds):
+        raise RuntimeError(
+            "Hytale-Login nicht abgeschlossen. Login-URL im Browser bestaetigen, "
+            "dann erneut 'Update'. "
+            + (f"URL: {verify}" if verify else "URL siehe Log / HYTALE_SETUP.txt.")
+        )
+
+    # 5d) Sonstiger Downloader-Fehler.
+    raise RuntimeError("Hytale: Server-Bundle wurde nicht geladen. Downloader: " + tail)
