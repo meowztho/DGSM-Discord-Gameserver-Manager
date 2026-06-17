@@ -506,6 +506,9 @@ def install(serverfiles, ctx):
     return "MyGame installed"
 ```
 
+A fully commented starter template lives in `plugin_templates/ExampleCustomGame/`
+(copy it, adjust `install.py` + `config.json`, remove the placeholder guard).
+
 ##### Hytale (bundled `install.py` plugin)
 
 The bundled `Hytale` template is an `install.py` plugin (logic ported from
