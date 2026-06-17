@@ -451,6 +451,7 @@ a letter-based `app_id` selects a built-in non-Steam installer instead:
 | `minecraft_fabric` | Fabric server launcher + server jar + matching Temurin JRE |
 | `minecraft_bedrock` | Official Bedrock dedicated server (no Java needed) |
 | `custom_url` | Generic: download any server from a direct URL (zip/tar.gz/.exe/.jar) |
+| `hytale` | Hytale dedicated server (Java 25 + official downloader tool) |
 
 The Minecraft templates set `auto_update: false` and bundle their own Java runtime into
 `serverfiles/jre`, so nothing has to be installed on the host. The required Java
@@ -482,9 +483,24 @@ inside the template folder; `/addserver` copies it verbatim into the instance.
 - `java` / `java_major`: provision a Temurin JRE into `serverfiles/jre` (for `.jar` servers).
 - `eula`: also write a Minecraft-style `eula.txt`.
 
-The bundled `Hytale` template is a ready-to-fill example: edit its `dgsm_install.json`
-`download_url`, set `executable` in `config.json`, then `/addserver template:Hytale`.
-Until a real URL is filled in, the install fails with a clear "set download_url" message.
+##### Hytale (`hytale`)
+
+Hytale's dedicated server is only reachable through the official downloader tool
+with a one-time OAuth login, so it has a dedicated provider (logic ported from the
+[WindowsGSM.Hytale](https://github.com/Raziel7893/WindowsGSM.Hytale) plugin).
+
+`/addserver template:Hytale` automatically provisions Java 25 into `serverfiles/jre`
+and the official downloader into `serverfiles/installer/`. The server files
+themselves require a **one-time login**:
+
+1. Run `/addserver template:Hytale` (sets up Java + downloader, writes `HYTALE_SETUP.txt`).
+2. Follow `HYTALE_SETUP.txt`: run the downloader once in a terminal, log in via the
+   printed URL. This produces `installer/Hytale.zip` and caches your credentials.
+3. Press **Update** in DGSM again — it extracts `Server/` + `Assets.zip` and starts.
+   Future updates run headless (credentials are cached).
+
+Start command used: `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
+(port **5520/UDP**). Adjust the jar name in the template if the official build differs.
 
 ### 3. `server_settings.json` per server instance
 

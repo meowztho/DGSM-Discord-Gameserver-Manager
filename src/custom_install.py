@@ -5,7 +5,7 @@ Anbindung:
   einen Buchstaben enthält, ist es KEIN Steam-Server und SteamCMD wird nie
   aufgerufen (siehe steam_integration.run_update). Der Buchstaben-Wert dient
   hier zugleich als Provider-Kennung, z. B.:
-      minecraft_vanilla | minecraft_fabric | minecraft_bedrock | custom_url
+      minecraft_vanilla | minecraft_fabric | minecraft_bedrock | custom_url | hytale
 
 - `custom_url` ist ein generischer Installer fuer beliebige Nicht-Steam-Server
   (z. B. Hytale) per Direktdownload. Die Parameter (URL, Archivtyp, ...) stehen
@@ -428,11 +428,124 @@ def _install_custom_url(serverfiles: str) -> str:
     return f"Custom-Install: {what}"
 
 
+# ----------------------------------------------------------------------------
+# Hytale (Logik aus WindowsGSM.Hytale von raziel7893 portiert)
+# ----------------------------------------------------------------------------
+# Der eigentliche Server ist nur ueber das offizielle Downloader-Tool mit
+# einmaligem OAuth-Login erreichbar. DGSM automatisiert alles Uebrige:
+#   - Java 25 (Temurin) nach serverfiles/jre
+#   - Downloader-Tool nach serverfiles/installer/
+#   - sobald Credentials gecacht sind: Server-Bundle headless laden + entpacken
+# Start: java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520
+_HYTALE_DOWNLOADER_URL = "https://downloader.hytale.com/hytale-downloader.zip"
+_HYTALE_JAVA_MAJOR = "25"
+_HYTALE_DOWNLOADER_TIMEOUT = int(os.getenv("HYTALE_DOWNLOADER_TIMEOUT", "1200"))
+
+
+def _hytale_downloader_name() -> str:
+    return "hytale-downloader-windows-amd64.exe" if is_windows() else "hytale-downloader-linux-amd64"
+
+
+def _extract_zip_file(zip_path: str, target_dir: str) -> None:
+    os.makedirs(target_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(target_dir)
+
+
+def _write_hytale_setup_note(serverfiles: str, installer_dir: str) -> None:
+    exe = _hytale_downloader_name()
+    run = (exe if is_windows() else f"./{exe}") + (
+        ' -download-path "Hytale.zip" -credentials-path ".hytale-downloader-credentials.json" -skip-update-check'
+    )
+    note = (
+        "Hytale - einmalige Einrichtung (OAuth-Login)\n"
+        "============================================\n"
+        "DGSM hat Java 25 und den Hytale-Downloader vorbereitet. Der erste Download\n"
+        "der Serverdateien erfordert einen einmaligen Login mit deinem Hytale-Account.\n\n"
+        f"1) Terminal in diesem Ordner oeffnen:\n   {installer_dir}\n"
+        f"2) Downloader starten:\n   {run}\n"
+        "3) Die angezeigte Login-URL im Browser oeffnen, einloggen, bestaetigen.\n"
+        "   Danach wird 'Hytale.zip' geladen und '.hytale-downloader-credentials.json'\n"
+        "   gespeichert.\n"
+        "4) In DGSM erneut 'Update' druecken - DGSM entpackt Server/ + Assets.zip,\n"
+        "   kuenftige Updates laufen dann automatisch (Credentials gecacht).\n\n"
+        "Start: java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520\n"
+        "Port 5520/UDP ggf. in Router/Firewall freigeben.\n"
+    )
+    with open(os.path.join(serverfiles, "HYTALE_SETUP.txt"), "w", encoding="utf-8") as f:
+        f.write(note)
+
+
+def _install_hytale(serverfiles: str) -> str:
+    os.makedirs(serverfiles, exist_ok=True)
+    installer_dir = os.path.join(serverfiles, "installer")
+    os.makedirs(installer_dir, exist_ok=True)
+
+    # 1) Java 25 bereitstellen (wie im WindowsGSM-Plugin)
+    _ensure_jre(serverfiles, _HYTALE_JAVA_MAJOR)
+
+    # 2) Downloader-Tool sicherstellen
+    downloader = os.path.join(installer_dir, _hytale_downloader_name())
+    if not os.path.isfile(downloader):
+        dl_zip = os.path.join(installer_dir, "hytale-downloader.zip")
+        _download_to(_HYTALE_DOWNLOADER_URL, dl_zip)
+        _extract_zip_file(dl_zip, installer_dir)
+        if not is_windows():
+            try:
+                os.chmod(downloader, 0o755)
+            except Exception:
+                pass
+
+    creds = os.path.join(installer_dir, ".hytale-downloader-credentials.json")
+    hytale_zip = os.path.join(installer_dir, "Hytale.zip")
+
+    # 3) Mit gecachten Credentials das Server-Bundle headless (nach)laden
+    if os.path.isfile(creds) and os.path.isfile(downloader):
+        import subprocess
+
+        try:
+            logging.info("[CUSTOM] Hytale: lade/aktualisiere Server-Bundle (headless) ...")
+            subprocess.run(
+                [downloader, "-download-path", hytale_zip,
+                 "-skip-update-check", "-credentials-path", creds],
+                cwd=installer_dir,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=_HYTALE_DOWNLOADER_TIMEOUT,
+                text=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[CUSTOM] Hytale-Downloader (headless) fehlgeschlagen: %s", exc)
+
+    # 4) Hytale.zip entpacken -> Server/ + Assets.zip (sauberer Stand)
+    if os.path.isfile(hytale_zip):
+        shutil.rmtree(os.path.join(serverfiles, "Server"), ignore_errors=True)
+        try:
+            os.remove(os.path.join(serverfiles, "Assets.zip"))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        _extract_zip_file(hytale_zip, serverfiles)
+
+    if os.path.isfile(os.path.join(serverfiles, "Server", "HytaleServer.jar")):
+        return "Hytale installiert (Server-Dateien vorhanden)"
+
+    # 5) Noch kein Server-Bundle -> einmalige OAuth-Anleitung hinterlegen
+    _write_hytale_setup_note(serverfiles, installer_dir)
+    return (
+        "Hytale vorbereitet (JRE 25 + Downloader). Einmaliger Login noetig - "
+        "siehe HYTALE_SETUP.txt im Serverordner, danach erneut 'Update' druecken."
+    )
+
+
 _INSTALLERS = {
     "minecraft_vanilla": _install_vanilla,
     "minecraft_fabric": _install_fabric,
     "minecraft_bedrock": _install_bedrock,
     "custom_url": _install_custom_url,
+    "hytale": _install_hytale,
 }
 
 
