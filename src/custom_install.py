@@ -5,11 +5,17 @@ Anbindung:
   einen Buchstaben enthält, ist es KEIN Steam-Server und SteamCMD wird nie
   aufgerufen (siehe steam_integration.run_update). Der Buchstaben-Wert dient
   hier zugleich als Provider-Kennung, z. B.:
-      minecraft_vanilla | minecraft_fabric | minecraft_bedrock | custom_url | hytale
+      minecraft_vanilla | minecraft_fabric | minecraft_bedrock | custom_url
 
 - `custom_url` ist ein generischer Installer fuer beliebige Nicht-Steam-Server
-  (z. B. Hytale) per Direktdownload. Die Parameter (URL, Archivtyp, ...) stehen
-  in einer `dgsm_install.json` im Template/Server-Ordner.
+  per Direktdownload. Die Parameter (URL, Archivtyp, ...) stehen in einer
+  `dgsm_install.json` im Template/Server-Ordner.
+
+- Universelles Plugin-Modell: liegt ein `install.py` im Template (und damit im
+  Server-Ordner), hat dessen `install(serverfiles, ctx)` Vorrang vor den
+  eingebauten Providern. So lassen sich neue Nicht-Steam-Spiele mit eigener
+  Logik (z. B. Hytale) als self-contained Template hinzufuegen, ohne den Core
+  anzufassen. `ctx` stellt stabile Helfer bereit (siehe _make_plugin_ctx).
 
 - Der Installer legt nur Dateien im serverfiles-Ordner ab. Welche Datei
   gestartet wird (executable/parameters) bestimmt weiterhin das Template bzw.
@@ -429,54 +435,15 @@ def _install_custom_url(serverfiles: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Hytale (Logik aus WindowsGSM.Hytale von raziel7893 portiert)
+# Generische Helfer fuer Template-Plugins (install.py) und Provider
 # ----------------------------------------------------------------------------
-# Der eigentliche Server ist nur ueber das offizielle Downloader-Tool mit
-# einmaligem OAuth-Login erreichbar. DGSM automatisiert alles Uebrige:
-#   - Java 25 (Temurin) nach serverfiles/jre
-#   - Downloader-Tool nach serverfiles/installer/
-#   - sobald Credentials gecacht sind: Server-Bundle headless laden + entpacken
-# Start: java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520
-_HYTALE_DOWNLOADER_URL = "https://downloader.hytale.com/hytale-downloader.zip"
-_HYTALE_JAVA_MAJOR = "25"
-_HYTALE_DOWNLOADER_TIMEOUT = int(os.getenv("HYTALE_DOWNLOADER_TIMEOUT", "1200"))
-
-
-def _hytale_downloader_name() -> str:
-    return "hytale-downloader-windows-amd64.exe" if is_windows() else "hytale-downloader-linux-amd64"
-
-
 def _extract_zip_file(zip_path: str, target_dir: str) -> None:
     os.makedirs(target_dir, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(target_dir)
 
 
-def _write_hytale_setup_note(serverfiles: str, installer_dir: str) -> None:
-    exe = _hytale_downloader_name()
-    run = (exe if is_windows() else f"./{exe}") + (
-        ' -download-path "Hytale.zip" -credentials-path ".hytale-downloader-credentials.json" -skip-update-check'
-    )
-    note = (
-        "Hytale - einmalige Einrichtung (OAuth-Login)\n"
-        "============================================\n"
-        "DGSM hat Java 25 und den Hytale-Downloader vorbereitet. Der erste Download\n"
-        "der Serverdateien erfordert einen einmaligen Login mit deinem Hytale-Account.\n\n"
-        f"1) Terminal in diesem Ordner oeffnen:\n   {installer_dir}\n"
-        f"2) Downloader starten:\n   {run}\n"
-        "3) Die angezeigte Login-URL im Browser oeffnen, einloggen, bestaetigen.\n"
-        "   Danach wird 'Hytale.zip' geladen und '.hytale-downloader-credentials.json'\n"
-        "   gespeichert.\n"
-        "4) In DGSM erneut 'Update' druecken - DGSM entpackt Server/ + Assets.zip,\n"
-        "   kuenftige Updates laufen dann automatisch (Credentials gecacht).\n\n"
-        "Start: java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520\n"
-        "Port 5520/UDP ggf. in Router/Firewall freigeben.\n"
-    )
-    with open(os.path.join(serverfiles, "HYTALE_SETUP.txt"), "w", encoding="utf-8") as f:
-        f.write(note)
-
-
-def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[HYTALE]"):
+def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[PLUGIN]"):
     """Startet ein externes Tool, streamt dessen Ausgabe zeilenweise ins Log
     (so wird die Geraete-Login-URL fuer den Nutzer sichtbar) und erzwingt ein
     hartes Timeout. Gibt (returncode, ausgabe_zeilen) zurueck."""
@@ -520,71 +487,49 @@ def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[HYTALE]"):
     return proc.returncode, captured
 
 
-def _install_hytale(serverfiles: str) -> str:
-    os.makedirs(serverfiles, exist_ok=True)
-    installer_dir = os.path.join(serverfiles, "installer")
-    os.makedirs(installer_dir, exist_ok=True)
+# ----------------------------------------------------------------------------
+# Template-Plugin-Hook: liegt ein install.py im Server-/Template-Ordner, wird
+# dessen install(serverfiles, ctx) ausgefuehrt (universelles, einfaches Plugin-
+# Modell aehnlich WindowsGSM, aber als kurze Python-Funktion statt C#-Klasse).
+# ----------------------------------------------------------------------------
+PLUGIN_ENTRY_FILE = "install.py"
 
-    # 1) Java 25 bereitstellen (wie im WindowsGSM-Plugin)
-    _ensure_jre(serverfiles, _HYTALE_JAVA_MAJOR)
 
-    # 2) Downloader-Tool sicherstellen
-    downloader = os.path.join(installer_dir, _hytale_downloader_name())
-    if not os.path.isfile(downloader):
-        dl_zip = os.path.join(installer_dir, "hytale-downloader.zip")
-        _download_to(_HYTALE_DOWNLOADER_URL, dl_zip)
-        _extract_zip_file(dl_zip, installer_dir)
-        if not is_windows():
-            try:
-                os.chmod(downloader, 0o755)
-            except Exception:
-                pass
+def _make_plugin_ctx():
+    """Stabile Helfer-API fuer Template-Plugins. Aenderungen hier moeglichst
+    rueckwaertskompatibel halten, da externe Plugins darauf bauen."""
+    from types import SimpleNamespace
 
-    creds = os.path.join(installer_dir, ".hytale-downloader-credentials.json")
-    hytale_zip = os.path.join(installer_dir, "Hytale.zip")
-
-    # 3) Downloader ausfuehren -> laedt das Server-Bundle. Beim ERSTEN Mal ist
-    #    ein Geraete-Login noetig: der Downloader gibt eine Login-URL aus (und
-    #    pollt selbst). Wir streamen seine Ausgabe ins DGSM-Log/Live-Log, damit
-    #    der Nutzer die URL sieht. Nach dem Login werden Credentials gecacht und
-    #    kuenftige Updates laufen vollautomatisch ohne Login.
-    auth_lines = []
-    if os.path.isfile(downloader):
-        if not os.path.isfile(creds):
-            logging.warning(
-                "[HYTALE] Erstmaliger Login noetig - bitte die gleich ausgegebene "
-                "Login-URL im Browser oeffnen und mit dem Hytale-Account bestaetigen."
-            )
-        rc, auth_lines = _run_logged_with_timeout(
-            [downloader, "-download-path", hytale_zip,
-             "-skip-update-check", "-credentials-path", creds],
-            installer_dir, _HYTALE_DOWNLOADER_TIMEOUT,
-        )
-        logging.info("[HYTALE] Downloader beendet (rc=%s)", rc)
-
-    # 4) Hytale.zip entpacken -> Server/ + Assets.zip (sauberer Stand)
-    if os.path.isfile(hytale_zip):
-        shutil.rmtree(os.path.join(serverfiles, "Server"), ignore_errors=True)
-        try:
-            os.remove(os.path.join(serverfiles, "Assets.zip"))
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-        _extract_zip_file(hytale_zip, serverfiles)
-
-    if os.path.isfile(os.path.join(serverfiles, "Server", "HytaleServer.jar")):
-        return "Hytale installiert/aktualisiert (Server-Dateien vorhanden)"
-
-    # 5) Kein Bundle -> Login wurde (noch) nicht abgeschlossen
-    _write_hytale_setup_note(serverfiles, installer_dir)
-    url = next((l for l in auth_lines if "http" in l.lower()), "")
-    hint = f" Login-URL: {url}" if url else ""
-    return (
-        "Hytale: Java + Downloader bereit, aber das Server-Bundle fehlt noch - "
-        "Login wurde nicht abgeschlossen. Login im Browser bestaetigen, dann "
-        "erneut 'Update' druecken." + hint
+    return SimpleNamespace(
+        log=logging.getLogger("dgsm.plugin"),
+        is_windows=is_windows,
+        http_get_bytes=_http_get_bytes,
+        http_get_json=_http_get_json,
+        download=_download_to,
+        extract_zip_bytes=_extract_zip_bytes,
+        extract_zip_file=_extract_zip_file,
+        ensure_jre=_ensure_jre,
+        write_eula=_write_eula,
+        run_logged=_run_logged_with_timeout,
     )
+
+
+def _run_template_plugin(install_dir: str) -> str:
+    import importlib.util
+    import uuid
+
+    path = os.path.join(install_dir, PLUGIN_ENTRY_FILE)
+    spec = importlib.util.spec_from_file_location(f"dgsm_plugin_{uuid.uuid4().hex}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{PLUGIN_ENTRY_FILE} konnte nicht geladen werden")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fn = getattr(module, "install", None)
+    if not callable(fn):
+        raise RuntimeError(f"{PLUGIN_ENTRY_FILE}: Funktion install(serverfiles, ctx) fehlt")
+    logging.info("[CUSTOM] Fuehre Template-Plugin aus: %s", path)
+    message = fn(install_dir, _make_plugin_ctx())
+    return str(message) if message else "Plugin-Install abgeschlossen"
 
 
 _INSTALLERS = {
@@ -592,7 +537,6 @@ _INSTALLERS = {
     "minecraft_fabric": _install_fabric,
     "minecraft_bedrock": _install_bedrock,
     "custom_url": _install_custom_url,
-    "hytale": _install_hytale,
 }
 
 
@@ -608,12 +552,18 @@ async def run_custom_install(server_name: str, app_id: str, install_dir: str) ->
     funktioniert.
     """
     provider = provider_from_app_id(app_id)
-    installer = _INSTALLERS.get(provider)
-    if not installer:
-        return False, (
-            f"Unbekannter Installer '{provider}'. "
-            f"Verfügbar: {', '.join(supported_providers())}"
-        )
+
+    # 1) Template-Plugin (install.py) hat Vorrang -> universelles Plugin-Modell.
+    if os.path.isfile(os.path.join(install_dir, PLUGIN_ENTRY_FILE)):
+        installer = _run_template_plugin
+    else:
+        # 2) Eingebauter Provider anhand der App-ID.
+        installer = _INSTALLERS.get(provider)
+        if not installer:
+            return False, (
+                f"Unbekannter Installer '{provider}'. Verfuegbar: "
+                f"{', '.join(supported_providers())} oder ein '{PLUGIN_ENTRY_FILE}' im Template."
+            )
 
     try:
         message = await asyncio.wait_for(

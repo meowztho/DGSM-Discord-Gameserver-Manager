@@ -67,8 +67,9 @@ Stop-Logik nutzt `psutil`, gespeicherte PIDs und baumartiges Terminieren:
 
 ### Custom-Install (Nicht-Steam)
 
-- Provider per (buchstabenbasierter) `app_id`: `minecraft_vanilla|_fabric|_bedrock`, `custom_url` und `hytale`
-- `hytale`: Logik aus WindowsGSM.Hytale portiert - JRE 25 + offizielles Downloader-Tool automatisch; Server-Bundle via einmaligem OAuth-Login (Downloader-CLI), danach headless. Start `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
+- Provider per (buchstabenbasierter) `app_id`: `minecraft_vanilla|_fabric|_bedrock`, `custom_url`
+- Universelles Plugin-Modell: liegt ein `install.py` im Server-/Template-Ordner, fuehrt DGSM dessen `install(serverfiles, ctx)` aus (Vorrang vor Providern). `ctx` bietet stabile Helfer (download, ensure_jre, extract, run_logged, ...). Neue Nicht-Steam-Spiele ohne Core-Eingriff.
+- `Hytale` ist so ein Plugin (Logik aus WindowsGSM.Hytale portiert): JRE 25 + offizielles Downloader-Tool automatisch; DGSM startet den Downloader und streamt die Geraete-Login-URL ins Log, danach headless. Start `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
 - Minecraft Vanilla/Fabric/Bedrock ohne SteamCMD; benoetigte Java-Version aus dem Mojang-Manifest, Temurin-JRE nach `serverfiles/jre`
 - `custom_url`: generischer Direktdownload (zip/tar.gz/.exe/.jar) fuer beliebige Server (z. B. Hytale). Parameter in `dgsm_install.json` (von /addserver unveraendert in die Instanz kopiert), optional JRE-Bereitstellung
 - Downloads nutzen ein gebuendeltes `certifi`-CA-Bundle (sonst `CERTIFICATE_VERIFY_FAILED` im PyInstaller-Build) und Retries gegen CDN-Aussetzer

@@ -451,7 +451,9 @@ a letter-based `app_id` selects a built-in non-Steam installer instead:
 | `minecraft_fabric` | Fabric server launcher + server jar + matching Temurin JRE |
 | `minecraft_bedrock` | Official Bedrock dedicated server (no Java needed) |
 | `custom_url` | Generic: download any server from a direct URL (zip/tar.gz/.exe/.jar) |
-| `hytale` | Hytale dedicated server (Java 25 + official downloader tool) |
+
+For anything with custom install logic, a template can also ship an `install.py`
+(see *Custom plugins* below) — that is how the bundled **Hytale** template works.
 
 The Minecraft templates set `auto_update: false` and bundle their own Java runtime into
 `serverfiles/jre`, so nothing has to be installed on the host. The required Java
@@ -483,23 +485,41 @@ inside the template folder; `/addserver` copies it verbatim into the instance.
 - `java` / `java_major`: provision a Temurin JRE into `serverfiles/jre` (for `.jar` servers).
 - `eula`: also write a Minecraft-style `eula.txt`.
 
-##### Hytale (`hytale`)
+##### Custom plugins (`install.py`)
 
-Hytale's dedicated server is only reachable through the official downloader tool
-with a one-time OAuth login, so it has a dedicated provider (logic ported from the
-[WindowsGSM.Hytale](https://github.com/Raziel7893/WindowsGSM.Hytale) plugin).
+For non-Steam servers with their own install logic, a template can include an
+`install.py` next to its `config.json`. If present, DGSM runs its
+`install(serverfiles, ctx)` on install/update instead of the built-in providers —
+a universal, self-contained plugin model (similar to WindowsGSM, but a short
+Python function instead of a C# class, and no core changes required).
 
-`/addserver template:Hytale` automatically provisions Java 25 into `serverfiles/jre`
-and the official downloader into `serverfiles/installer/`. The server files
-themselves require a **one-time login**:
+`ctx` provides stable helpers: `log`, `is_windows()`, `download(url, dest)`,
+`http_get_bytes/json(url)`, `extract_zip_file/bytes(...)`, `ensure_jre(dir, major)`,
+`write_eula(dir)`, and `run_logged(cmd, cwd, timeout, prefix) -> (rc, lines)`
+(streams a tool's output to the log — handy for device-login flows).
 
-1. Run `/addserver template:Hytale` (sets up Java + downloader, writes `HYTALE_SETUP.txt`).
-2. Follow `HYTALE_SETUP.txt`: run the downloader once in a terminal, log in via the
-   printed URL. This produces `installer/Hytale.zip` and caches your credentials.
-3. Press **Update** in DGSM again — it extracts `Server/` + `Assets.zip` and starts.
-   Future updates run headless (credentials are cached).
+```python
+# plugin_templates/MyGame/install.py
+def install(serverfiles, ctx):
+    ctx.download("https://example.com/server.zip", serverfiles + "/server.zip")
+    ctx.extract_zip_file(serverfiles + "/server.zip", serverfiles)
+    return "MyGame installed"
+```
 
-Start command used: `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
+##### Hytale (bundled `install.py` plugin)
+
+The bundled `Hytale` template is an `install.py` plugin (logic ported from
+[WindowsGSM.Hytale](https://github.com/Raziel7893/WindowsGSM.Hytale)). On
+`/addserver template:Hytale` or **Update**, DGSM provisions Java 25, fetches the
+official downloader and runs it, **streaming the device-login URL to the log**.
+
+1. `/addserver template:Hytale` → DGSM sets up Java + downloader and starts it.
+2. Open the printed login URL (also in `HYTALE_SETUP.txt`), log in with your
+   Hytale account. The downloader then fetches `Hytale.zip` and caches credentials.
+3. Press **Update** → DGSM extracts `Server/` + `Assets.zip`. Future updates run
+   headless (no login).
+
+Start command: `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
 (port **5520/UDP**). Adjust the jar name in the template if the official build differs.
 
 ### 3. `server_settings.json` per server instance
