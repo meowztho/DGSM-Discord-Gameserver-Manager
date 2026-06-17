@@ -1,0 +1,18 @@
+{
+    "app_id": "minecraft_vanilla",
+    "executable": "jre\\bin\\java.exe",
+    "executable_windows": "jre\\bin\\java.exe",
+    "executable_linux": "jre/bin/java",
+    "auto_start": false,
+    "auto_update": false,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": [
+        "-Xms2G",
+        "-Xmx4G",
+        "-jar",
+        "server.jar",
+        "nogui"
+    ]
+}

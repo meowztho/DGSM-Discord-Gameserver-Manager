@@ -1,0 +1,13 @@
+{
+    "app_id": "1110390",
+    "executable": "Unturned.exe",
+    "executable_windows": "",
+    "executable_linux": "",
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": true,
+    "parameters": [
+        "-server"
+    ]
+}
