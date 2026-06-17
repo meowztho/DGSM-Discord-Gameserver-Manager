@@ -450,11 +450,41 @@ a letter-based `app_id` selects a built-in non-Steam installer instead:
 | `minecraft_vanilla` | Official Minecraft Java server + matching Temurin JRE |
 | `minecraft_fabric` | Fabric server launcher + server jar + matching Temurin JRE |
 | `minecraft_bedrock` | Official Bedrock dedicated server (no Java needed) |
+| `custom_url` | Generic: download any server from a direct URL (zip/tar.gz/.exe/.jar) |
 
-These templates set `auto_update: false` and bundle their own Java runtime into
+The Minecraft templates set `auto_update: false` and bundle their own Java runtime into
 `serverfiles/jre`, so nothing has to be installed on the host. The required Java
 version is read from Mojang's version manifest, so new Minecraft releases get a
 matching JRE automatically. Add one with `/addserver template:MinecraftFabric` (or `MinecraftVanilla` / `MinecraftBedrock`).
+
+##### Generic download installer (`custom_url`)
+
+For any non-Steam server that is published as a direct download (for example a
+future **Hytale** server build, or any game that ships a `.exe`/`.jar`/archive),
+use the `custom_url` provider. The download details live in a `dgsm_install.json`
+inside the template folder; `/addserver` copies it verbatim into the instance.
+
+```json
+{
+  "download_url": "https://example.com/server-win.zip",
+  "archive": "auto",          
+  "strip_top_level": false,    
+  "filename": "",              
+  "java": false,               
+  "java_major": "",            
+  "eula": false                
+}
+```
+
+- `archive`: `auto` (detect by URL extension) / `zip` / `targz` / `none` (single file).
+- `strip_top_level`: drop a single wrapping folder inside the archive.
+- `filename`: target name for a single-file download (defaults to the URL's name).
+- `java` / `java_major`: provision a Temurin JRE into `serverfiles/jre` (for `.jar` servers).
+- `eula`: also write a Minecraft-style `eula.txt`.
+
+The bundled `Hytale` template is a ready-to-fill example: edit its `dgsm_install.json`
+`download_url`, set `executable` in `config.json`, then `/addserver template:Hytale`.
+Until a real URL is filled in, the install fails with a clear "set download_url" message.
 
 ### 3. `server_settings.json` per server instance
 
