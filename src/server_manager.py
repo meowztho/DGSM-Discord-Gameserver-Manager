@@ -4,6 +4,7 @@ import os
 import json
 import signal
 import subprocess
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Iterable
 import glob
@@ -25,6 +26,14 @@ server_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 server_processes: Dict[str, psutil.Process] = {}
 daily_stopped_servers = set()
+
+# Auto-Restart-Backoff: schlaegt ein Server zu oft kurz hintereinander fehl
+# (z. B. defekte/fehlende Startdatei), wird auto_restart pausiert, statt alle
+# 30s neu zu starten. Ein manueller Start hebt die Pause wieder auf.
+_AUTO_RESTART_WINDOW = 300   # Sekunden
+_AUTO_RESTART_MAX = 5        # so viele Neustarts im Fenster -> pausieren
+_restart_history: Dict[str, list] = {}
+auto_restart_suspended: set = set()
 
 
 def _normalize_params(p) -> List[str]:
@@ -239,8 +248,14 @@ async def auto_update_if_enabled(server_name: str):
         logging.info(f"[AUTO-UPDATE] {server_name}: {'OK' if ok else 'FAIL'} | {msg}")
 
 
-async def start_server(server_name: str) -> bool:
-    """Startet den Server, macht vorher ein Update wenn auto_update aktiviert ist."""
+async def start_server(server_name: str, _auto: bool = False) -> bool:
+    """Startet den Server, macht vorher ein Update wenn auto_update aktiviert ist.
+
+    `_auto=True` kennzeichnet einen automatischen Neustart durch den Monitor.
+    Ein manueller Start (_auto=False) setzt den Auto-Restart-Backoff zurueck."""
+    if not _auto:
+        _restart_history.pop(server_name, None)
+        auto_restart_suspended.discard(server_name)
     success = False
     fail_reason = ""
     begin_operation(server_name, "start")
@@ -562,14 +577,33 @@ async def monitor_servers():
             load_server_configs()
             last_reload = loop.time()
 
-        # Crash-Watch
+        # Crash-Watch (mit Backoff gegen Endlos-Neustart)
         for name in list(server_processes.keys()):
             try:
                 if not server_processes[name].is_running():
                     server_processes.pop(name)
                     cfg = SERVER_CONFIGS.get(name, {})
-                    if cfg.get("auto_restart", True):
-                        await start_server(name)
+                    if not cfg.get("auto_restart", True):
+                        continue
+                    if name in auto_restart_suspended:
+                        continue
+
+                    now = time.monotonic()
+                    hist = [t for t in _restart_history.get(name, []) if now - t < _AUTO_RESTART_WINDOW]
+                    hist.append(now)
+                    _restart_history[name] = hist
+
+                    if len(hist) >= _AUTO_RESTART_MAX:
+                        auto_restart_suspended.add(name)
+                        msg = (
+                            f"{len(hist)} Neustarts in < {_AUTO_RESTART_WINDOW}s - "
+                            f"auto_restart pausiert (manueller Start reaktiviert)"
+                        )
+                        logging.error("[MONITOR] %s: %s", name, msg)
+                        write_action_log("auto_restart", name, "suspended", msg)
+                        continue
+
+                    await start_server(name, _auto=True)
             except Exception:
                 server_processes.pop(name, None)
 
