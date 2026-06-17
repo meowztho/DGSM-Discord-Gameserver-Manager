@@ -30,7 +30,7 @@ tags:
 | --- | --- |
 | [../src/server_manager.py](../src/server_manager.py) | Start, Stop, Monitoring, PID-Recovery, Auto-Start beim Boot |
 | [../src/steam_integration.py](../src/steam_integration.py) | SteamCMD-Aufloesung, Download, Update, Session-Dateien; Dispatch zu Custom-Install bei buchstabenbasierter `app_id` |
-| [../src/custom_install.py](../src/custom_install.py) | Nicht-Steam-Installer (Minecraft Vanilla/Fabric/Bedrock), Temurin-JRE-Bereitstellung |
+| [../src/custom_install.py](../src/custom_install.py) | Nicht-Steam-Installer (Minecraft, custom_url), Temurin-JRE, sowie Template-Plugin-Hook (`install.py` + ctx-Helfer-API) |
 | [../src/platform_utils.py](../src/platform_utils.py) | Windows/Linux-Erkennung und Executable-Varianten |
 | [../src/paths.py](../src/paths.py) | Ableitung effektiver Serverpfade aus Config-Eintraegen |
 
