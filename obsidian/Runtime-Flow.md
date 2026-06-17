@@ -67,8 +67,9 @@ Stop-Logik nutzt `psutil`, gespeicherte PIDs und baumartiges Terminieren:
 
 ### Custom-Install (Nicht-Steam)
 
-- Minecraft Vanilla/Fabric/Bedrock ohne SteamCMD
-- benoetigte Java-Version wird aus dem Mojang-Manifest gelesen, passende Temurin-JRE nach `serverfiles/jre` entpackt
+- Provider per (buchstabenbasierter) `app_id`: `minecraft_vanilla|_fabric|_bedrock` und `custom_url`
+- Minecraft Vanilla/Fabric/Bedrock ohne SteamCMD; benoetigte Java-Version aus dem Mojang-Manifest, Temurin-JRE nach `serverfiles/jre`
+- `custom_url`: generischer Direktdownload (zip/tar.gz/.exe/.jar) fuer beliebige Server (z. B. Hytale). Parameter in `dgsm_install.json` (von /addserver unveraendert in die Instanz kopiert), optional JRE-Bereitstellung
 - Downloads nutzen ein gebuendeltes `certifi`-CA-Bundle (sonst `CERTIFICATE_VERIFY_FAILED` im PyInstaller-Build) und Retries gegen CDN-Aussetzer
 
 ## Backup- und Restore-Pfad

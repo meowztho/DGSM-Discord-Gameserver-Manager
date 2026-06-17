@@ -5,7 +5,11 @@ Anbindung:
   einen Buchstaben enthält, ist es KEIN Steam-Server und SteamCMD wird nie
   aufgerufen (siehe steam_integration.run_update). Der Buchstaben-Wert dient
   hier zugleich als Provider-Kennung, z. B.:
-      minecraft_vanilla | minecraft_fabric | minecraft_bedrock
+      minecraft_vanilla | minecraft_fabric | minecraft_bedrock | custom_url
+
+- `custom_url` ist ein generischer Installer fuer beliebige Nicht-Steam-Server
+  (z. B. Hytale) per Direktdownload. Die Parameter (URL, Archivtyp, ...) stehen
+  in einer `dgsm_install.json` im Template/Server-Ordner.
 
 - Der Installer legt nur Dateien im serverfiles-Ordner ab. Welche Datei
   gestartet wird (executable/parameters) bestimmt weiterhin das Template bzw.
@@ -308,10 +312,127 @@ def _install_bedrock(serverfiles: str) -> str:
     return "Minecraft (Bedrock) installiert"
 
 
+# ----------------------------------------------------------------------------
+# Generischer URL-Installer (für beliebige Nicht-Steam-Server, z. B. Hytale)
+# ----------------------------------------------------------------------------
+# Die Install-Parameter stehen in einer separaten Datei `dgsm_install.json` im
+# Template. Sie wird von /addserver unveraendert in den serverfiles-Ordner
+# kopiert (kein Schema/keine Normalisierung), daher beliebig erweiterbar.
+#
+# Beispiel dgsm_install.json:
+# {
+#   "download_url": "https://example.com/hytale-server-win.zip",
+#   "archive": "auto",          # auto | zip | targz | none
+#   "strip_top_level": false,    # einen einzelnen Wurzelordner im Archiv entfernen
+#   "filename": "",              # Zieldateiname bei Einzeldatei (sonst aus URL)
+#   "java": false,               # JRE bereitstellen (für .jar-Server)
+#   "java_major": "",            # gewuenschte Java-Major (sonst Default)
+#   "eula": false                # Minecraft-style eula.txt schreiben
+# }
+_INSTALL_SPEC_FILE = "dgsm_install.json"
+
+
+def _read_install_spec(serverfiles: str) -> dict:
+    path = os.path.join(serverfiles, _INSTALL_SPEC_FILE)
+    if not os.path.isfile(path):
+        raise RuntimeError(f"{_INSTALL_SPEC_FILE} fehlt im Server-Ordner")
+    with open(path, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+    if not isinstance(spec, dict):
+        raise RuntimeError(f"{_INSTALL_SPEC_FILE}: ungueltiges Format (Objekt erwartet)")
+    return spec
+
+
+def _guess_archive_kind(url: str, explicit) -> str:
+    kind = str(explicit or "auto").lower()
+    if kind != "auto":
+        return kind
+    low = url.lower().split("?", 1)[0]
+    if low.endswith(".zip"):
+        return "zip"
+    if low.endswith((".tar.gz", ".tgz", ".tar")):
+        return "targz"
+    return "none"
+
+
+def _filename_from_url(url: str) -> str:
+    from urllib.parse import urlparse, unquote
+
+    return os.path.basename(unquote(urlparse(url).path)) or ""
+
+
+def _extract_archive_bytes(data: bytes, kind: str, target_dir: str, strip_top_level: bool) -> None:
+    tmp = os.path.join(target_dir, "_dl_tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        if kind == "zip":
+            _extract_zip_bytes(data, tmp)
+        else:
+            import tarfile
+
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+                tf.extractall(tmp)
+
+        src_root = tmp
+        entries = [os.path.join(tmp, e) for e in os.listdir(tmp)]
+        if strip_top_level and len(entries) == 1 and os.path.isdir(entries[0]):
+            src_root = entries[0]
+
+        for item in os.listdir(src_root):
+            s = os.path.join(src_root, item)
+            d = os.path.join(target_dir, item)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(d) or target_dir, exist_ok=True)
+                shutil.copy2(s, d)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _install_custom_url(serverfiles: str) -> str:
+    """Generischer Installer: laedt eine in dgsm_install.json hinterlegte URL.
+
+    Eignet sich fuer beliebige Nicht-Steam-Server, die per Direktdownload
+    bereitgestellt werden (ZIP/TAR-Archiv oder einzelne .exe/.jar)."""
+    os.makedirs(serverfiles, exist_ok=True)
+    spec = _read_install_spec(serverfiles)
+
+    url = str(spec.get("download_url") or "").strip()
+    if not url or url.startswith("<"):
+        raise RuntimeError(
+            f"'download_url' in {_INSTALL_SPEC_FILE} setzen (Platzhalter erkannt)"
+        )
+
+    kind = _guess_archive_kind(url, spec.get("archive"))
+    if kind in ("zip", "targz"):
+        data = _http_get_bytes(url)
+        _extract_archive_bytes(data, kind, serverfiles, bool(spec.get("strip_top_level", False)))
+        what = f"Archiv ({kind}) entpackt"
+    else:
+        fname = (
+            str(spec.get("filename") or "").strip()
+            or _filename_from_url(url)
+            or str(spec.get("executable") or "").strip()
+            or "server.bin"
+        )
+        _download_to(url, os.path.join(serverfiles, fname))
+        what = f"Datei '{fname}' geladen"
+
+    if spec.get("java"):
+        _ensure_jre(serverfiles, spec.get("java_major"))
+    if spec.get("eula"):
+        _write_eula(serverfiles)
+
+    return f"Custom-Install: {what}"
+
+
 _INSTALLERS = {
     "minecraft_vanilla": _install_vanilla,
     "minecraft_fabric": _install_fabric,
     "minecraft_bedrock": _install_bedrock,
+    "custom_url": _install_custom_url,
 }
 
 

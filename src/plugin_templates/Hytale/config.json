@@ -1,0 +1,12 @@
+{
+    "app_id": "custom_url",
+    "executable": "",
+    "executable_windows": "",
+    "executable_linux": "",
+    "auto_start": false,
+    "auto_update": false,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": []
+}

@@ -1,0 +1,10 @@
+{
+    "_hinweis": "Generischer Download-Installer (Provider custom_url). Trage unten die echte Server-Download-URL ein. Hytale hat noch keinen offiziellen Server-Download - sobald einer existiert (oder ein eigener Build), hier eintragen.",
+    "download_url": "<HIER_SERVER_DOWNLOAD_URL_EINTRAGEN>",
+    "archive": "auto",
+    "strip_top_level": false,
+    "filename": "",
+    "java": false,
+    "java_major": "",
+    "eula": false
+}
