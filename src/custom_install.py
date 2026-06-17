@@ -476,6 +476,50 @@ def _write_hytale_setup_note(serverfiles: str, installer_dir: str) -> None:
         f.write(note)
 
 
+def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[HYTALE]"):
+    """Startet ein externes Tool, streamt dessen Ausgabe zeilenweise ins Log
+    (so wird die Geraete-Login-URL fuer den Nutzer sichtbar) und erzwingt ein
+    hartes Timeout. Gibt (returncode, ausgabe_zeilen) zurueck."""
+    import subprocess
+    import threading
+
+    captured: list = []
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("%s Start des Tools fehlgeschlagen: %s", prefix, exc)
+        return None, captured
+
+    def _pump():
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.rstrip()
+                if line:
+                    logging.info("%s %s", prefix, line)
+                    captured.append(line)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logging.warning("%s Timeout nach %ss - beende Tool", prefix, timeout)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    t.join(timeout=5)
+    return proc.returncode, captured
+
+
 def _install_hytale(serverfiles: str) -> str:
     os.makedirs(serverfiles, exist_ok=True)
     installer_dir = os.path.join(serverfiles, "installer")
@@ -499,24 +543,24 @@ def _install_hytale(serverfiles: str) -> str:
     creds = os.path.join(installer_dir, ".hytale-downloader-credentials.json")
     hytale_zip = os.path.join(installer_dir, "Hytale.zip")
 
-    # 3) Mit gecachten Credentials das Server-Bundle headless (nach)laden
-    if os.path.isfile(creds) and os.path.isfile(downloader):
-        import subprocess
-
-        try:
-            logging.info("[CUSTOM] Hytale: lade/aktualisiere Server-Bundle (headless) ...")
-            subprocess.run(
-                [downloader, "-download-path", hytale_zip,
-                 "-skip-update-check", "-credentials-path", creds],
-                cwd=installer_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=_HYTALE_DOWNLOADER_TIMEOUT,
-                text=True,
+    # 3) Downloader ausfuehren -> laedt das Server-Bundle. Beim ERSTEN Mal ist
+    #    ein Geraete-Login noetig: der Downloader gibt eine Login-URL aus (und
+    #    pollt selbst). Wir streamen seine Ausgabe ins DGSM-Log/Live-Log, damit
+    #    der Nutzer die URL sieht. Nach dem Login werden Credentials gecacht und
+    #    kuenftige Updates laufen vollautomatisch ohne Login.
+    auth_lines = []
+    if os.path.isfile(downloader):
+        if not os.path.isfile(creds):
+            logging.warning(
+                "[HYTALE] Erstmaliger Login noetig - bitte die gleich ausgegebene "
+                "Login-URL im Browser oeffnen und mit dem Hytale-Account bestaetigen."
             )
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("[CUSTOM] Hytale-Downloader (headless) fehlgeschlagen: %s", exc)
+        rc, auth_lines = _run_logged_with_timeout(
+            [downloader, "-download-path", hytale_zip,
+             "-skip-update-check", "-credentials-path", creds],
+            installer_dir, _HYTALE_DOWNLOADER_TIMEOUT,
+        )
+        logging.info("[HYTALE] Downloader beendet (rc=%s)", rc)
 
     # 4) Hytale.zip entpacken -> Server/ + Assets.zip (sauberer Stand)
     if os.path.isfile(hytale_zip):
@@ -530,13 +574,16 @@ def _install_hytale(serverfiles: str) -> str:
         _extract_zip_file(hytale_zip, serverfiles)
 
     if os.path.isfile(os.path.join(serverfiles, "Server", "HytaleServer.jar")):
-        return "Hytale installiert (Server-Dateien vorhanden)"
+        return "Hytale installiert/aktualisiert (Server-Dateien vorhanden)"
 
-    # 5) Noch kein Server-Bundle -> einmalige OAuth-Anleitung hinterlegen
+    # 5) Kein Bundle -> Login wurde (noch) nicht abgeschlossen
     _write_hytale_setup_note(serverfiles, installer_dir)
+    url = next((l for l in auth_lines if "http" in l.lower()), "")
+    hint = f" Login-URL: {url}" if url else ""
     return (
-        "Hytale vorbereitet (JRE 25 + Downloader). Einmaliger Login noetig - "
-        "siehe HYTALE_SETUP.txt im Serverordner, danach erneut 'Update' druecken."
+        "Hytale: Java + Downloader bereit, aber das Server-Bundle fehlt noch - "
+        "Login wurde nicht abgeschlossen. Login im Browser bestaetigen, dann "
+        "erneut 'Update' druecken." + hint
     )
 
 
