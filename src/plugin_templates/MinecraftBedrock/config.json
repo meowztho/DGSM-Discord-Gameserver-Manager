@@ -1,0 +1,12 @@
+{
+    "app_id": "minecraft_bedrock",
+    "executable": "bedrock_server.exe",
+    "executable_windows": "bedrock_server.exe",
+    "executable_linux": "bedrock_server",
+    "auto_start": false,
+    "auto_update": false,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false,
+    "parameters": []
+}

@@ -1,0 +1,15 @@
+{
+    "executable": "CoreKeeperServer.exe",
+    "executable_windows": "",
+    "executable_linux": "",
+    "parameters": [
+        "-batchmode",
+        "-nographics",
+        "-norendering",
+        "-activatecontent GiantCicadaBossDungeon,NatureBiomeCicadas,GuaranteedOases,AbioticFactor"
+    ],
+    "auto_update": true,
+    "auto_restart": true,
+    "stop_time": "05:00",
+    "restart_after_stop": false
+}

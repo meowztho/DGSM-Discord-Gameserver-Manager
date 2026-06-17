@@ -1,0 +1,548 @@
+﻿# DGSM – Discord Gameserver Manager
+## for Windows and Linux(untested).
+
+![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
+
+
+Manage and automate your game servers directly from Discord – no remote desktop required.\
+Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through Discord commands and buttons on Windows and new on Linux(untested).
+
+## Table of Contents
+
+---
+
+- [DGSM – Discord Gameserver Manager](#dgsm--discord-gameserver-manager)
+  - [Features](#-features)
+  - [Project Scope & Design Philosophy](#project-scope--design-philosophy)
+  - [Installation](#-installation)
+  - [Release Package (Code + Dist)](#-release-package-code--dist)
+  - [Discord Bot Setup](#️-discord-bot-setup)
+  - [Optional CLI Commands](#️-optional-cli-commands)
+  - [Local Desktop UI (Addon)](#️-local-desktop-ui-addon)
+  - [Build Windows EXE](#️-build-windows-exe)
+  - [Screenshots](#-screenshots)
+  - [SteamCMD Setup](#-steamcmd-setup)
+  - [Backup & Restore](#-backup--restore)
+  - [Configuration File Reference](#configuration-file-reference)
+    - [`server_config.json`](#1-srcserver_configjson)
+    - [`plugin_templates`](#2-srcplugin_templates)
+    - [`server_settings.json`](#3-server_settingsjson-per-server-instance)
+  - [FAQ](#faq)
+  - [Support this Project](#-support-this-project)
+  - [License](#-license)
+
+---
+
+![Main Bot UI](docs/bot_ui.png)
+
+<img src="docs/GUI..png" alt="Main Bot UI" width="75%">
+---
+
+## ✨ Features
+
+- Start / Stop / Restart / Status via buttons and slash commands
+- Optionaler `/cli` Slash-Command für Kommando-Workflow (Discord bleibt Hauptsteuerung)
+- Optional local **Desktop UI** (Windows/Linux)
+- UI-only startup mode if Discord env values are missing
+- Create ZIP backups via `/createbackup`
+- Restore server data from ZIP backups via `/restorebackup`
+- Live operation states in UI (start/stop/update/backup/restore)
+- Optional auto-start on boot, auto-update and scheduled restart
+- Non-Steam installs via templates: Minecraft **Vanilla**, **Fabric** and **Bedrock** (bundled Java, no host setup)
+- Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
+- Role & permission checks for admin actions
+- SQLite logging, JSON configuration
+- Automatic SteamCMD download (if missing) into `src/steam/`
+- Automatic runtime detection for Windows/Linux behavior
+- Runs on Windows and Linux servers
+- Keeps existing templates usable with OS-specific executable fallback
+- Normalized template JSON schema across all `plugin_templates`
+
+---
+
+## Obsidian Vault
+
+You can open the repository root directly in Obsidian as a vault.
+
+- Start with `00-Obsidian-Start.md`
+- Project notes live in `obsidian/`
+- The shared vault setup is stored in `.obsidian/`
+
+---
+
+## 📦 Installation
+
+1. **Install Python 3.12**\
+   [https://www.python.org/downloads/](https://www.python.org/downloads/)\
+   On Windows, check **"Add Python to PATH"**. On Linux, install `python3` and `pip` via your distro package manager if needed.
+
+2. **Download DGSM**
+
+   - Click the green **Code** button → **Download ZIP**
+   - Or clone:
+     ```bash
+     git clone https://github.com/meowztho/DGSM-Discord-Gameserver-Manager.git
+     cd DGSM-Discord-Gameserver-Manager
+     ```
+
+3. **Install dependencies**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **First run**\
+   Simply start the bot:
+
+   ```bash
+   # from repository root
+   python src/Main.py
+
+   # or from inside src/
+   python Main.py
+   ```
+
+   On first run, DGSM will:
+
+   - Load values from `src/.env` (if present)
+   - Auto-create `ENCRYPTION_KEY` in `src/.env` if missing
+   - Start in UI-only mode if Discord env is incomplete
+   - Load server entries from `src/server_config.json` (if present)
+
+   After setup:
+
+   - Manage templates in `src/plugin_templates/`
+   - Add servers via `/addserver` (recommended) or directly in `src/server_config.json`
+   - For a second server with the same template/app, set `instance_id` in `/addserver` (optional)
+   - Backups are stored in `src/steam/backup`
+
+---
+
+## 🚀 Release Package (Code + Dist)
+
+From `v2.0.1`, releases can include both:
+
+- full source code (as before)
+- prebuilt Windows package in `dist/DGSM/`
+
+Start prebuilt version with:
+
+```powershell
+dist\DGSM\DGSM.exe
+```
+
+Important: keep the source tree next to `dist`, because runtime data stays in `src/`.
+
+Runtime paths used by DGSM:
+
+- `src/.env`
+- `src/server_config.json`
+- `src/server_pids.json`
+- `src/plugin_templates/`
+- `src/steam/`
+- `src/steam/steamcmd.exe` (Windows) or `src/steam/steamcmd.sh` (Linux)
+- `src/steam/GSM/servers/`
+
+---
+
+## ⚙️ Discord Bot Setup
+
+Before running DGSM with a real token, you must create a bot account in the Discord Developer Portal.
+
+1. **Go to the Developer Portal**\
+   [https://discord.com/developers/applications](https://discord.com/developers/applications)
+
+2. **Create a new application**
+
+   - Click **New Application**
+   - Name it (e.g., `DGSM Server Manager`)
+
+3. **Add a Bot User**
+
+   - Go to **Bot** in the left menu
+   - Click **Add Bot** → **Yes, do it!**
+   - Enable these intents:
+     - `PRESENCE INTENT`
+     - `SERVER MEMBERS INTENT`
+     - `MESSAGE CONTENT INTENT`
+   - Reset token and copy it for `.env`
+
+4. **Set Admin Channel ID**
+
+   - In Discord, enable **Developer Mode** (Settings → Advanced)
+   - Right-click your admin channel → **Copy Channel ID**
+   - Add to `.env`
+
+5. **Invite the bot to your server**
+
+   - Go to **OAuth2 → URL Generator**
+   - Under **SCOPES**, check:
+     - `bot`
+     - `applications.commands`
+   - Under **BOT PERMISSIONS**, check:
+     - `Send Messages`
+     - `Embed Links`
+     - `Read Message History`
+     - `Use Slash Commands`
+   - Copy the generated URL → open in browser → Authorize bot for your server.
+
+6. **Create required roles**
+
+   - In your Discord server settings, go to **Roles** and create:
+     - **Admin** – for full bot control and all admin commands
+     - **Player** – for basic usage such as viewing status, starting servers (if allowed)
+   - Assign these roles to users accordingly. The bot checks these roles to determine command permissions.
+
+---
+
+## ⌨️ Optional CLI Commands
+
+DGSM includes an optional command-style control layer that uses the same backend logic as Discord/UI actions.
+
+- Discord remains the primary control path.
+- CLI commands are available via Discord slash command `/cli`.
+- The desktop UI exposes the same CLI commands inside the **Live Log** panel.
+- No arbitrary shell execution is supported; only DGSM management commands are accepted.
+
+Supported commands:
+
+- `help`
+- `list`
+- `status [server]`
+- `start <server>`
+- `stop <server>`
+- `restart <server>`
+- `update <server>`
+- `refresh`
+
+Examples:
+
+```text
+/cli command:"list"
+/cli command:"status Palworld-main"
+/cli command:"restart Palworld-main"
+```
+
+In desktop UI Live Log CLI bar:
+
+```text
+list
+status Palworld-main
+update Palworld-main
+```
+
+---
+
+## 🖥️ Local Desktop UI (Addon)
+
+DGSM includes a local desktop control window for Windows and Linux (PySide6 required) and an optional local browser UI.
+
+- Starts automatically together with the bot
+- Uses **PySide6 (Qt for Python)** with a modern dark Soft-UI style
+- Uses the same backend logic as Discord commands
+- Discord stays the main control path
+- Includes card-based server controls and live console output
+- Includes a compact CLI command bar inside the Live Log panel
+- Reflects Discord-side command state changes in the desktop dashboard
+- Settings changed in desktop UI are pushed to Discord status panel refresh
+- Unsaved setting edits stay in the form until you press `SAVE CFG`
+- Linux note: a graphical display/session is required for the UI window (headless servers can use Discord-only mode).
+- Browser UI note: the web server rejects non-local-network clients and is disabled by default.
+
+Dependency note:
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs `PySide6` for the desktop UI.
+
+Environment toggle:
+
+```env
+DGSM_DESKTOP_UI_ENABLED=true
+DGSM_WEB_UI_ENABLED=false
+DGSM_WEB_UI_HOST=127.0.0.1
+DGSM_WEB_UI_PORT=8765
+DGSM_WEB_UI_LOCAL_NETWORK_ONLY=true
+```
+
+Set it to `false` to disable the desktop window.
+
+Set `DGSM_WEB_UI_ENABLED=true` to enable browser access. With the default host it is reachable only on the same machine:
+
+```text
+http://127.0.0.1:8765
+```
+
+For LAN access, bind it to the server's LAN IP or `0.0.0.0`:
+
+```env
+DGSM_WEB_UI_HOST=0.0.0.0
+```
+
+The request filter still allows only loopback, private LAN, and link-local client IPs by default.
+Set `DGSM_WEB_UI_LOCAL_NETWORK_ONLY=false` to disable that client-IP filter.
+
+Optional: hide the separate console window while desktop UI is open:
+
+```env
+DGSM_HIDE_CONSOLE_WHEN_UI=true
+```
+
+Note: `DGSM_HIDE_CONSOLE_WHEN_UI` applies to Windows console behavior.
+
+---
+
+## 🛠️ Build Windows EXE
+
+Use the included build script:
+
+```powershell
+build.bat
+```
+
+The script:
+
+- builds `dist/DGSM/DGSM.exe` with PyInstaller
+- embeds `src/Logo.ico` as executable icon
+- keeps runtime path logic aligned with `src/`
+- ensures required runtime folders exist (`src/steam/GSM/servers`, `src/plugin_templates`)
+
+---
+
+## 📷 Screenshots
+
+| Main Menu | Server Status |
+| --------- | ------------- |
+|![Main Menu](docs/bot_ui.png)|![Server Status](docs/bot_status.png)|
+|![Server Status](docs/slashcommand.png)|![Server Status](docs/full.png)|
+<img src="docs/GUI..png" alt="Main Bot UI" width="75%">
+
+---
+
+## 📥 SteamCMD Setup
+
+Some servers require SteamCMD to install or update.
+
+1. DGSM supports these SteamCMD locations:
+
+   - `steam/steamcmd.exe` (Windows) or `steam/steamcmd.sh` (Linux) relative to `Main.py`
+   - Path from env variable `STEAMCMD_PATH`
+   - Any SteamCMD available in your system `PATH`
+
+2. If SteamCMD is not found, DGSM can auto-download it to `src/steam/` using:
+
+   - `STEAMCMD_DOWNLOAD_URL` from `src/.env`
+   - default (Windows): `https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip`
+   - default (Linux): `https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz`
+
+3. Optional: set `STEAMCMD_PATH` in `src/.env`, for example:
+
+   ```env
+   STEAMCMD_PATH=C:\\Tools\\SteamCMD\\steamcmd.exe
+   ```
+
+   Linux example:
+
+   ```env
+   STEAMCMD_PATH=/opt/steamcmd/steamcmd.sh
+   ```
+
+4. If `STEAMCMD_DOWNLOAD_URL` is empty, DGSM chooses the correct default automatically based on OS.
+
+---
+
+## 💾 Backup & Restore
+
+DGSM supports Discord-driven backups and restores.
+
+- Default backup folder: `src/steam/backup`
+- Create backup: `/createbackup name:<server>`
+- Restore backup: `/restorebackup name:<server> backup_file:<file.zip> overwrite:<true|false>`
+- Backup selection supports files from `src/steam/backup` (and legacy `src/backups` if present)
+- Bot responses show short backup paths like `/steam/backup/<file>.zip` (no full absolute path)
+- UI updates automatically after backup/restore and does not stay stuck on "Backup running"
+
+---
+
+## Configuration File Reference
+
+DGSM reads and writes its runtime config in `src/server_config.json`.
+
+### 1. `src/server_config.json`
+
+```json
+{
+  "log_retention_days": 7,
+  "server_paths": {
+    "Palworld-main": {
+      "app_id": "2394010",
+      "executable": "PalServer.exe",
+      "instance_id": "Palworld-main",
+      "username": "steam_user_optional",
+      "password": "gAAAA...encrypted..."
+    }
+  }
+}
+```
+
+Fields used by the bot:
+
+- `log_retention_days`: retention for action logs in SQLite.
+- `server_paths.<name>.app_id`: required Steam AppID.
+- `server_paths.<name>.executable`: optional executable file name.
+  DGSM resolves this OS-aware (for example Linux can auto-try alternatives if template still contains `.exe`).
+- `server_paths.<name>.instance_id`: optional instance folder key. `/addserver` can set this explicitly, otherwise it is generated automatically.
+- `server_paths.<name>.install_dir`: optional custom serverfiles path (absolute or relative to `src/`).
+- `server_paths.<name>.username` / `password`: optional Steam login. Password is encrypted in config.
+
+### 2. `src/plugin_templates/<TemplateName>/`
+
+Each template folder normally contains:
+
+- `config.json`: install/update metadata like `app_id`, update flags and optional Steam credentials.
+  `executable` is optional.
+  Optional OS overrides: `executable_windows` and `executable_linux`.
+- `server_settings.json`: copied into the server instance and used for runtime options.
+  If no executable is configured, DGSM auto-detects a start file after install/start and writes hints back.
+
+Behavior summary:
+
+- If a template comes without `executable`, it is accepted.
+- DGSM automatically detects a suitable start file on Windows/Linux and writes it back as a hint.
+- You can still set `executable_windows` / `executable_linux` explicitly for exact control.
+
+Template schema (normalized):
+
+```json
+{
+  "app_id": "2394010",
+  "executable": "PalServer.exe",
+  "executable_windows": "",
+  "executable_linux": "",
+  "auto_start": false,
+  "auto_update": true,
+  "auto_restart": true,
+  "stop_time": "05:00",
+  "restart_after_stop": false,
+  "parameters": []
+}
+```
+
+Runtime option fields (also written into each instance's `server_settings.json`):
+
+- `auto_start`: start this server automatically when DGSM boots (default `false`).
+- `auto_update`: run an update before every start (Steam apps only).
+- `auto_restart`: restart automatically if the process crashes.
+- `stop_time`: daily stop time `HH:MM` (empty disables the scheduled stop).
+- `restart_after_stop`: restart again after the scheduled daily stop.
+
+Older templates/instances without `auto_start` keep working — the field defaults to `false` and is added automatically the next time the file is written.
+
+#### Non-Steam templates (Minecraft)
+
+`app_id` doubles as the install provider. A purely numeric `app_id` uses SteamCMD;
+a letter-based `app_id` selects a built-in non-Steam installer instead:
+
+| `app_id` | Installs |
+| --- | --- |
+| `minecraft_vanilla` | Official Minecraft Java server + matching Temurin JRE |
+| `minecraft_fabric` | Fabric server launcher + server jar + matching Temurin JRE |
+| `minecraft_bedrock` | Official Bedrock dedicated server (no Java needed) |
+
+These templates set `auto_update: false` and bundle their own Java runtime into
+`serverfiles/jre`, so nothing has to be installed on the host. The required Java
+version is read from Mojang's version manifest, so new Minecraft releases get a
+matching JRE automatically. Add one with `/addserver template:MinecraftFabric` (or `MinecraftVanilla` / `MinecraftBedrock`).
+
+### 3. `server_settings.json` per server instance
+
+Typical locations:
+
+- Legacy layout: `src/steam/GSM/servers/<app_id>/serverfiles/server_settings.json`
+- Instance layout: `src/steam/GSM/servers/<app_id>/instances/<instance_id>/serverfiles/server_settings.json`
+
+It holds the same runtime option fields as the template (`auto_start`, `auto_update`,
+`auto_restart`, `stop_time`, `restart_after_stop`) plus `executable` and `parameters`.
+These are editable from Discord (`/cli`, settings), the desktop UI and the web UI.
+
+Notes:
+
+- Keep backups before manual edits.
+- JSON must be valid.
+- `auto_start` takes effect on the next DGSM start; check the log for `[AUTO-START]` lines.
+
+---
+
+## Project Scope & Design Philosophy
+
+DGSM is **not a web-based game server panel**.
+
+Tools like PufferPanel or Pterodactyl focus on managing servers through a web UI
+and assume that administrators are available and have panel access.
+
+DGSM solves a different problem:
+
+In many guilds or communities, the server owner is often offline.
+When a server crashes or is stopped, players usually cannot restart it
+without waiting for an admin or requesting RDP / panel access.
+
+DGSM treats **Discord as the primary control plane**:
+
+- Discord is the main interface, not an add-on
+- Role-based access is handled through Discord roles
+- Trusted players can start stopped servers without web panel access
+- No exposed web UI is required
+- Headless operation is fully supported
+
+A local desktop UI exists, but it is optional and uses the same backend logic.
+Discord remains the authoritative control interface by design.
+
+---
+
+## FAQ
+
+### Why not use an existing panel like PufferPanel or Pterodactyl?
+Those panels are web-UI–centric and designed for administrators.
+DGSM focuses on Discord-first workflows where trusted players
+can start or manage servers without panel access.
+
+### Is DGSM a replacement for web-based panels?
+No. DGSM targets a different use case.
+It complements environments where Discord is already the main coordination tool.
+
+### Why Discord instead of a web UI?
+Because players are already on Discord.
+DGSM removes the need for RDP sessions, panel logins, or exposing web interfaces.
+
+### Is a local UI required?
+No. The desktop UI is optional.
+DGSM can run fully headless with Discord as the only interface.
+
+### Is Linux supported?
+Linux support has been added recently and works in current tests,
+but it is not yet widely battle-tested.
+Feedback from Linux users is welcome.
+
+### Why are some messages mixed German and English?
+Localization cleanup is planned.
+Functionality currently has priority over full translation consistency.
+
+
+---
+
+
+## 💖 Support this project
+
+If DGSM saves you time or helps you run your servers, please consider supporting development:
+
+- [**GitHub Sponsors**](https://github.com/sponsors/meowztho)
+- [**Paypal**](paypal.me/farrnbacher)
+
+---
+
+## 📜 License
+
+MIT – see [LICENSE](LICENSE) for details.
+
