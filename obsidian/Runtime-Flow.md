@@ -84,7 +84,8 @@ Backup/Restore wird sowohl in Discord als auch in der Desktop-UI angeboten:
 
 ## Laufende Beobachtung
 
-- `monitor_servers()` prueft den Zustand aktiver Server
+- `monitor_servers()` prueft den Zustand aktiver Server; bei Absturz Neustart, wenn `auto_restart` aktiv
+- Auto-Restart-Backoff: >= 5 Neustarts in < 300s -> `auto_restart` wird pausiert (`auto_restart_suspended`), Log/Action-Log-Eintrag; ein manueller Start reaktiviert. Verhindert Endlos-Neustart bei defekter/fehlender Startdatei.
 - `runtime_status.py` meldet laufende Operationen wie `start`, `stop`, `update`, `backup` oder `restore`
 - Discord-Panel und Desktop-UI koennen dadurch denselben Aktivitaetszustand anzeigen
 
