@@ -443,22 +443,56 @@ def _extract_zip_file(zip_path: str, target_dir: str) -> None:
         zf.extractall(target_dir)
 
 
+def _kill_proc_tree(proc) -> None:
+    """Beendet den Prozess inkl. aller Kindprozesse, damit kein Tool im
+    Hintergrund weiterlaeuft (z. B. ein pollender Downloader)."""
+    import subprocess
+    import signal
+
+    if proc.poll() is not None:
+        return
+    try:
+        if is_windows():
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[PLUGIN]"):
-    """Startet ein externes Tool, streamt dessen Ausgabe zeilenweise ins Log
-    (so wird die Geraete-Login-URL fuer den Nutzer sichtbar) und erzwingt ein
-    hartes Timeout. Gibt (returncode, ausgabe_zeilen) zurueck."""
+    """Startet ein externes Tool fuer GENAU EINEN Versuch, streamt dessen
+    Ausgabe zeilenweise ins Log (so wird z. B. die Geraete-Login-URL sichtbar)
+    und stoppt es nach dem Timeout hart - inkl. Kindprozessen. Es bleibt nichts
+    im Hintergrund laufen. Gibt (returncode, ausgabe_zeilen) zurueck."""
     import subprocess
     import threading
 
     captured: list = []
+    popen_kwargs = dict(
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    # Eigene Prozessgruppe/Session, damit der ganze Baum sauber killbar ist.
+    if is_windows():
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        proc = subprocess.Popen(
-            cmd, cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as exc:  # noqa: BLE001
         logging.warning("%s Start des Tools fehlgeschlagen: %s", prefix, exc)
         return None, captured
@@ -478,11 +512,11 @@ def _run_logged_with_timeout(cmd, cwd, timeout, prefix="[PLUGIN]"):
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        logging.warning("%s Timeout nach %ss - beende Tool", prefix, timeout)
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        logging.warning("%s Timeout nach %ss - stoppe Tool (ein Versuch)", prefix, timeout)
+        _kill_proc_tree(proc)
+    finally:
+        # Garantie: nach diesem Aufruf laeuft nichts mehr weiter.
+        _kill_proc_tree(proc)
     t.join(timeout=5)
     return proc.returncode, captured
 
