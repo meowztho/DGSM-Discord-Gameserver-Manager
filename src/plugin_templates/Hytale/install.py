@@ -26,7 +26,10 @@ import shutil
 
 DOWNLOADER_URL = "https://downloader.hytale.com/hytale-downloader.zip"
 JAVA_MAJOR = "25"
-DOWNLOADER_TIMEOUT = int(os.getenv("HYTALE_DOWNLOADER_TIMEOUT", "1200"))
+# EIN gebundener Versuch pro Install/Update. Reicht das Zeitfenster fuer den
+# Browser-Login nicht, stoppt der Downloader und du drueckst einfach erneut
+# 'Update'. So blockiert nichts dauerhaft und es laeuft nichts im Hintergrund.
+DOWNLOADER_TIMEOUT = int(os.getenv("HYTALE_DOWNLOADER_TIMEOUT", "120"))
 
 
 def _downloader_name(ctx):
