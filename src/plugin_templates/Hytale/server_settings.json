@@ -1,8 +1,15 @@
 {
-    "executable": "",
-    "executable_windows": "",
-    "executable_linux": "",
-    "parameters": [],
+    "executable": "jre\\bin\\java.exe",
+    "executable_windows": "jre\\bin\\java.exe",
+    "executable_linux": "jre/bin/java",
+    "parameters": [
+        "-jar",
+        "Server/HytaleServer.jar",
+        "--assets",
+        "Assets.zip",
+        "--bind",
+        "0.0.0.0:5520"
+    ],
     "auto_start": false,
     "auto_update": false,
     "auto_restart": true,
