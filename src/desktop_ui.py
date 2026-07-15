@@ -30,6 +30,7 @@ from runtime_status import (
 from server_manager import server_processes, start_server, stop_server, ensure_server_executable_hint
 from steam_integration import run_update
 from security import encrypt_value
+from cli_commands import execute_cli_command
 from template_utils import (
     build_template_config,
     read_template_config,
@@ -37,6 +38,8 @@ from template_utils import (
     template_settings_from_config,
     write_template_files,
 )
+from rest_bridge import collect_rest_snapshot
+from wgsm_import import format_import_summary, import_wgsm_plugin
 
 try:
     import psutil
@@ -52,6 +55,7 @@ try:
         QDialog,
         QFrame,
         QGraphicsDropShadowEffect,
+        QGridLayout,
         QHBoxLayout,
         QInputDialog,
         QLabel,
@@ -91,6 +95,15 @@ _PROC_NET_SAMPLE: Dict[int, Tuple[int, int]] = {}
 _PROC_NET_SAMPLE_TS = 0.0
 _PROC_CPU_SAMPLE: Dict[int, float] = {}
 _PROC_CPU_SAMPLE_TS = 0.0
+_BOT_CPU_SAMPLE: Optional[float] = None
+_BOT_CPU_SAMPLE_TS = 0.0
+_BOT_IO_SAMPLE: Optional[Tuple[int, int]] = None
+_BOT_IO_SAMPLE_TS = 0.0
+_METRICS_CACHE: Dict[str, str] = {}
+_METRICS_CACHE_TS = 0.0
+_METRICS_CACHE_SECONDS = 2.0
+_SERVER_RESOURCE_CACHE: Dict[str, Dict[str, object]] = {}
+_METRICS_LOCK = threading.Lock()
 _APP_ICON = None
 
 _THEME = {
@@ -316,7 +329,7 @@ def _is_within_path(base_dir: str, candidate: str) -> bool:
         return False
 
 
-def _running_server_roots(rows: Optional[List[Dict[str, object]]] = None) -> List[str]:
+def _running_server_roots_by_name(rows: Optional[List[Dict[str, object]]] = None) -> Dict[str, str]:
     names: set[str] = set()
     if rows:
         for row in rows:
@@ -336,162 +349,225 @@ def _running_server_roots(rows: Optional[List[Dict[str, object]]] = None) -> Lis
             except Exception:
                 continue
 
-    roots: List[str] = []
+    roots: Dict[str, str] = {}
     for name in names:
         root = SERVER_PATHS.get(name)
         if root:
-            roots.append(os.path.normcase(os.path.abspath(root)))
-
-    seen: set[str] = set()
-    unique: List[str] = []
-    for root in roots:
-        if root not in seen:
-            seen.add(root)
-            unique.append(root)
-    return unique
+            roots[name] = os.path.normcase(os.path.abspath(root))
+    return roots
 
 
-def _collect_scoped_process_metrics(scope_roots: List[str]) -> Tuple[float, int, float, float]:
-    """
-    Best-effort metrics for processes inside the given server roots.
-    Returns: (cpu_percent, rss_bytes, upload_per_sec, download_per_sec)
-    """
+def _running_server_roots(rows: Optional[List[Dict[str, object]]] = None) -> List[str]:
+    return list(dict.fromkeys(_running_server_roots_by_name(rows).values()))
+
+
+def _collect_server_process_metrics(scope_roots: Dict[str, str]) -> Dict[str, Dict[str, object]]:
+    """Collect one bounded process snapshot and attribute it to running servers."""
     global _PROC_NET_SAMPLE, _PROC_NET_SAMPLE_TS, _PROC_CPU_SAMPLE, _PROC_CPU_SAMPLE_TS
     if psutil is None:
-        return 0.0, 0, 0.0, 0.0
+        return {}
 
     if not scope_roots:
         _PROC_CPU_SAMPLE = {}
         _PROC_NET_SAMPLE = {}
         _PROC_CPU_SAMPLE_TS = time.time()
         _PROC_NET_SAMPLE_TS = _PROC_CPU_SAMPLE_TS
-        return 0.0, 0, 0.0, 0.0
+        return {}
 
     now = time.time()
     current_cpu: Dict[int, float] = {}
     current: Dict[int, Tuple[int, int]] = {}
-    rss_total = 0
+    process_servers: Dict[int, str] = {}
+    resources: Dict[str, Dict[str, object]] = {
+        name: {"cpu": 0.0, "rss": 0, "read_bps": 0.0, "write_bps": 0.0}
+        for name in scope_roots
+    }
     try:
         for proc in psutil.process_iter(attrs=["pid", "exe", "cwd"]):
             try:
                 exe = str(proc.info.get("exe") or "")
                 cwd = str(proc.info.get("cwd") or "")
-                in_scope = False
-                for root in scope_roots:
+                server_name = ""
+                for name, root in scope_roots.items():
                     if (exe and _is_within_path(root, exe)) or (cwd and _is_within_path(root, cwd)):
-                        in_scope = True
+                        server_name = name
                         break
-                if not in_scope:
+                if not server_name:
                     continue
+                pid = int(proc.pid)
+                process_servers[pid] = server_name
                 cpu_times = proc.cpu_times()
                 total_cpu_time = float(getattr(cpu_times, "user", 0.0) or 0.0) + float(getattr(cpu_times, "system", 0.0) or 0.0)
-                current_cpu[int(proc.pid)] = total_cpu_time
+                current_cpu[pid] = total_cpu_time
 
                 mem = proc.memory_info()
-                rss_total += int(getattr(mem, "rss", 0) or 0)
+                resources[server_name]["rss"] = int(resources[server_name]["rss"]) + int(getattr(mem, "rss", 0) or 0)
 
                 io = proc.io_counters()
                 read_bytes = int(getattr(io, "read_bytes", 0) or 0)
                 write_bytes = int(getattr(io, "write_bytes", 0) or 0)
-                current[int(proc.pid)] = (read_bytes, write_bytes)
+                current[pid] = (read_bytes, write_bytes)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
             except Exception:
                 continue
     except Exception:
-        return 0.0, 0, 0.0, 0.0
+        return resources
 
-    proc_cpu_percent = 0.0
     elapsed_cpu = now - _PROC_CPU_SAMPLE_TS
     if _PROC_CPU_SAMPLE and elapsed_cpu > 0:
-        delta_cpu = 0.0
         for pid, total_now in current_cpu.items():
             prev_total = _PROC_CPU_SAMPLE.get(pid)
-            if prev_total is None:
+            server_name = process_servers.get(pid)
+            if prev_total is None or not server_name:
                 continue
             if total_now >= prev_total:
-                delta_cpu += total_now - prev_total
+                resources[server_name]["cpu"] = float(resources[server_name]["cpu"]) + total_now - prev_total
         cpu_count = int(psutil.cpu_count(logical=True) or 1)
-        if cpu_count < 1:
-            cpu_count = 1
-        proc_cpu_percent = (delta_cpu / elapsed_cpu) * 100.0 / cpu_count
-        proc_cpu_percent = max(0.0, min(100.0, proc_cpu_percent))
+        for values in resources.values():
+            cpu = (float(values["cpu"]) / elapsed_cpu) * 100.0 / max(1, cpu_count)
+            values["cpu"] = max(0.0, min(100.0, cpu))
 
     _PROC_CPU_SAMPLE = current_cpu
     _PROC_CPU_SAMPLE_TS = now
 
     elapsed = now - _PROC_NET_SAMPLE_TS
-    if not _PROC_NET_SAMPLE or elapsed <= 0:
-        _PROC_NET_SAMPLE = current
-        _PROC_NET_SAMPLE_TS = now
-        return proc_cpu_percent, rss_total, 0.0, 0.0
-
-    delta_read = 0
-    delta_write = 0
-    for pid, (read_now, write_now) in current.items():
-        prev = _PROC_NET_SAMPLE.get(pid)
-        if not prev:
-            continue
-        read_prev, write_prev = prev
-        if read_now >= read_prev:
-            delta_read += read_now - read_prev
-        if write_now >= write_prev:
-            delta_write += write_now - write_prev
+    if _PROC_NET_SAMPLE and elapsed > 0:
+        for pid, (read_now, write_now) in current.items():
+            prev = _PROC_NET_SAMPLE.get(pid)
+            server_name = process_servers.get(pid)
+            if not prev or not server_name:
+                continue
+            read_prev, write_prev = prev
+            if read_now >= read_prev:
+                resources[server_name]["read_bps"] = float(resources[server_name]["read_bps"]) + (read_now - read_prev) / elapsed
+            if write_now >= write_prev:
+                resources[server_name]["write_bps"] = float(resources[server_name]["write_bps"]) + (write_now - write_prev) / elapsed
 
     _PROC_NET_SAMPLE = current
     _PROC_NET_SAMPLE_TS = now
-    return (proc_cpu_percent, rss_total, delta_write / elapsed, delta_read / elapsed)
+    return resources
+
+
+def _collect_scoped_process_metrics(scope_roots: List[str]) -> Tuple[float, int, float, float]:
+    resources = _collect_server_process_metrics({"servers": root for root in scope_roots})
+    values = resources.get("servers", {})
+    return (
+        float(values.get("cpu", 0.0) or 0.0),
+        int(values.get("rss", 0) or 0),
+        float(values.get("write_bps", 0.0) or 0.0),
+        float(values.get("read_bps", 0.0) or 0.0),
+    )
+
+
+def _collect_bot_process_metrics() -> Dict[str, object]:
+    global _BOT_CPU_SAMPLE, _BOT_CPU_SAMPLE_TS, _BOT_IO_SAMPLE, _BOT_IO_SAMPLE_TS
+    result: Dict[str, object] = {"cpu": 0.0, "rss": 0, "read_bps": 0.0, "write_bps": 0.0}
+    if psutil is None:
+        return result
+    now = time.time()
+    try:
+        proc = psutil.Process(os.getpid())
+        cpu_times = proc.cpu_times()
+        total_cpu = float(getattr(cpu_times, "user", 0.0) or 0.0) + float(getattr(cpu_times, "system", 0.0) or 0.0)
+        elapsed_cpu = now - _BOT_CPU_SAMPLE_TS
+        if _BOT_CPU_SAMPLE is not None and elapsed_cpu > 0:
+            cpu_count = int(psutil.cpu_count(logical=True) or 1)
+            result["cpu"] = max(0.0, min(100.0, ((total_cpu - _BOT_CPU_SAMPLE) / elapsed_cpu) * 100.0 / max(1, cpu_count)))
+        _BOT_CPU_SAMPLE = total_cpu
+        _BOT_CPU_SAMPLE_TS = now
+        result["rss"] = int(getattr(proc.memory_info(), "rss", 0) or 0)
+
+        io_now = proc.io_counters()
+        current_io = (int(getattr(io_now, "read_bytes", 0) or 0), int(getattr(io_now, "write_bytes", 0) or 0))
+        elapsed_io = now - _BOT_IO_SAMPLE_TS
+        if _BOT_IO_SAMPLE is not None and elapsed_io > 0:
+            result["read_bps"] = max(0.0, (current_io[0] - _BOT_IO_SAMPLE[0]) / elapsed_io)
+            result["write_bps"] = max(0.0, (current_io[1] - _BOT_IO_SAMPLE[1]) / elapsed_io)
+        _BOT_IO_SAMPLE = current_io
+        _BOT_IO_SAMPLE_TS = now
+    except Exception:
+        pass
+    return result
+
+
+def _number(value: object) -> Optional[int]:
+    try:
+        return int(float(str(value)))
+    except Exception:
+        return None
+
+
+def _api_player_metric(rows: Optional[List[Dict[str, object]]]) -> str:
+    current_total = 0
+    maximum_total = 0
+    api_count = 0
+    found_current = False
+    found_maximum = False
+    for row in rows or []:
+        rest = row.get("rest")
+        if not isinstance(rest, dict) or not rest.get("enabled") or not rest.get("available"):
+            continue
+        sections = rest.get("sections")
+        if not isinstance(sections, dict):
+            continue
+        metrics = sections.get("metrics")
+        current = _number(metrics.get("currentplayernum")) if isinstance(metrics, dict) else None
+        maximum = _number(metrics.get("maxplayernum")) if isinstance(metrics, dict) else None
+        if current is None:
+            players = sections.get("players")
+            if isinstance(players, dict) and isinstance(players.get("players"), list):
+                current = len(players.get("players") or [])
+        if current is None and maximum is None:
+            continue
+        api_count += 1
+        if current is not None:
+            current_total += max(0, current)
+            found_current = True
+        if maximum is not None:
+            maximum_total += max(0, maximum)
+            found_maximum = True
+    if not api_count or not found_current:
+        return "No API data"
+    api_label = "API" if api_count == 1 else "APIs"
+    if found_maximum:
+        return f"{current_total}/{maximum_total} | {api_count} {api_label}"
+    return f"{current_total} active | {api_count} {api_label}"
 
 
 def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> Dict[str, str]:
-    running = 0
-    if rows:
-        running = sum(1 for row in rows if str(row.get("state", "")) == "running")
-    metrics = {
-        "cpu": "n/a",
-        "ram": "n/a",
-        "disk": "n/a",
-        "network": "n/a",
-        "servers": str(running),
-        "uptime": _format_uptime(time.time() - _APP_STARTED_TS),
-    }
-    if psutil is None:
+    global _METRICS_CACHE, _METRICS_CACHE_TS, _SERVER_RESOURCE_CACHE
+    running = sum(1 for row in rows or [] if str(row.get("state", "")) == "running")
+    total_servers = len(rows or [])
+    now = time.time()
+    with _METRICS_LOCK:
+        if _METRICS_CACHE and now - _METRICS_CACHE_TS < _METRICS_CACHE_SECONDS:
+            metrics = dict(_METRICS_CACHE)
+            metrics["players"] = _api_player_metric(rows)
+            metrics["servers"] = f"{running} / {total_servers}"
+        else:
+            server_resources = _collect_server_process_metrics(_running_server_roots_by_name(rows))
+            bot_resources = _collect_bot_process_metrics()
+            _SERVER_RESOURCE_CACHE = server_resources
+            server_cpu = sum(float(item.get("cpu", 0.0) or 0.0) for item in server_resources.values())
+            server_rss = sum(int(item.get("rss", 0) or 0) for item in server_resources.values())
+            server_read = sum(float(item.get("read_bps", 0.0) or 0.0) for item in server_resources.values())
+            server_write = sum(float(item.get("write_bps", 0.0) or 0.0) for item in server_resources.values())
+            metrics = {
+                "dgsm": f"{float(bot_resources['cpu']):.1f}% CPU | {_human_bytes(int(bot_resources['rss']))}",
+                "game_servers": f"{server_cpu:.1f}% CPU | {_human_bytes(server_rss)}",
+                "server_io": f"R {_human_bytes(server_read)}/s | W {_human_bytes(server_write)}/s",
+                "players": _api_player_metric(rows),
+                "servers": f"{running} / {total_servers}",
+                "uptime": _format_uptime(now - _APP_STARTED_TS),
+            }
+            _METRICS_CACHE = dict(metrics)
+            _METRICS_CACHE_TS = now
+
+        for row in rows or []:
+            name = str(row.get("name", "") or "")
+            row["resources"] = dict(_SERVER_RESOURCE_CACHE.get(name, {}))
         return metrics
-
-    proc_cpu = 0.0
-    proc_rss = 0
-    proc_up = 0.0
-    proc_down = 0.0
-    try:
-        proc_cpu, proc_rss, proc_up, proc_down = _collect_scoped_process_metrics(_running_server_roots(rows))
-    except Exception:
-        pass
-
-    try:
-        cpu = psutil.cpu_percent(interval=None)
-        metrics["cpu"] = f"{cpu:.0f}% | proc {proc_cpu:.1f}%"
-    except Exception:
-        pass
-    try:
-        mem = psutil.virtual_memory()
-        proc_ram_pct = (float(proc_rss) / float(mem.total) * 100.0) if getattr(mem, "total", 0) else 0.0
-        metrics["ram"] = f"{mem.percent:.0f}% | proc {_human_bytes(proc_rss)} ({proc_ram_pct:.1f}%)"
-    except Exception:
-        pass
-    try:
-        disk = psutil.disk_usage(BASE_DIR)
-        metrics["disk"] = f"{disk.percent:.0f}% ({_human_bytes(disk.free)} free)"
-    except Exception:
-        pass
-    try:
-        net = psutil.net_io_counters()
-        metrics["network"] = (
-            f"↑ {_human_bytes(net.bytes_sent)} | ↓ {_human_bytes(net.bytes_recv)} | "
-            f"proc↑ {_human_bytes(proc_up)}/s | proc↓ {_human_bytes(proc_down)}/s"
-        )
-    except Exception:
-        pass
-    return metrics
 
 
 def _bootstrap_log_lines() -> None:
@@ -603,6 +679,7 @@ def _settings_for(name: str) -> Dict[str, str | bool]:
     return {
         "executable": str(cfg.get("executable", "") or ""),
         "parameters": params_text,
+        "auto_start": bool(cfg.get("auto_start", False)),
         "auto_update": bool(cfg.get("auto_update", False)),
         "auto_restart": bool(cfg.get("auto_restart", True)),
         "restart_after_stop": bool(cfg.get("restart_after_stop", False)),
@@ -650,7 +727,7 @@ def notify_external_refresh(reason: str = "") -> None:
         try:
             if reason:
                 window.set_status(_clean(f"Discord sync: {reason}", 200))
-            window.refresh_data()
+            window.refresh_data(reload_config=True)
         except Exception:
             logging.exception("Desktop UI external refresh failed")
 
@@ -677,29 +754,51 @@ async def _wait_busy_or_done(name: str, task: asyncio.Task) -> None:
         await asyncio.sleep(0.05)
 
 
-async def _collect_servers() -> List[Dict[str, object]]:
-    load_server_paths()
-    load_server_configs()
+async def _collect_servers(reload_config: bool = False) -> List[Dict[str, object]]:
+    if reload_config:
+        load_server_paths()
+        load_server_configs()
 
     out: List[Dict[str, object]] = []
+    rest_tasks: List[Tuple[Dict[str, object], asyncio.Task]] = []
     names = sorted(SERVER_PATHS.keys(), key=lambda item: str(item).lower())
     for index, name in enumerate(names, start=1):
         status_label, state_key, detail = _status_for(name)
         fb = _ACTION_FEEDBACK.get(name)
         feedback = f"[{fb.get('status')}] {fb.get('message')}" if fb else ""
+        running = _is_running(name)
 
-        out.append(
-            {
-                "id": index,
-                "name": name,
-                "status": status_label,
-                "state": state_key,
-                "detail": detail,
-                "running": _is_running(name),
-                "feedback": feedback,
-                "settings": _settings_for(name),
-            }
-        )
+        row = {
+            "id": index,
+            "name": name,
+            "status": status_label,
+            "state": state_key,
+            "detail": detail,
+            "running": running,
+            "feedback": feedback,
+            "settings": _settings_for(name),
+            "resources": dict(_SERVER_RESOURCE_CACHE.get(name, {})),
+        }
+        out.append(row)
+        cfg = SERVER_CONFIGS.get(name, {})
+        if isinstance(cfg, dict):
+            rest_tasks.append((row, asyncio.create_task(collect_rest_snapshot(name, cfg, running))))
+
+    if rest_tasks:
+        for row, task in rest_tasks:
+            try:
+                row["rest"] = await task
+            except Exception as exc:
+                row["rest"] = {
+                    "configured": False,
+                    "enabled": False,
+                    "available": False,
+                    "status": "error",
+                    "summary": [],
+                    "sections": {},
+                    "errors": {"bridge": _clean(str(exc), 120)},
+                    "updated_at": None,
+                }
     return out
 
 
@@ -783,6 +882,13 @@ async def _run_action(name: str, action: str) -> Tuple[bool, str]:
         _schedule_discord_refresh()
 
 
+async def _run_cli_user_command(command_line: str) -> Tuple[bool, str]:
+    result = await execute_cli_command(command_line, source="desktop-ui")
+    if result.refresh:
+        await _safe_refresh_discord_panel()
+    return result.ok, result.message
+
+
 async def _save_settings(
     name: str,
     executable: str,
@@ -791,6 +897,7 @@ async def _save_settings(
     auto_restart: bool,
     restart_after_stop: bool,
     stop_time: str,
+    auto_start: bool = False,
 ) -> Tuple[bool, str]:
     def _fail(message: str) -> Tuple[bool, str]:
         _feedback(name, "failed", message)
@@ -820,7 +927,7 @@ async def _save_settings(
         cfg: Dict[str, object] = {}
         if os.path.isfile(path):
             try:
-                with open(path, "r", encoding="utf-8") as handle:
+                with open(path, "r", encoding="utf-8-sig") as handle:
                     raw = json.load(handle)
                 if isinstance(raw, dict):
                     cfg = raw
@@ -829,6 +936,7 @@ async def _save_settings(
 
         cfg["executable"] = str(executable or "").strip()
         cfg["parameters"] = param_list
+        cfg["auto_start"] = bool(auto_start)
         cfg["auto_update"] = bool(auto_update)
         cfg["auto_restart"] = bool(auto_restart)
         cfg["restart_after_stop"] = bool(restart_after_stop)
@@ -843,7 +951,7 @@ async def _save_settings(
             name,
             "success",
             (
-                f"auto_update={auto_update} auto_restart={auto_restart} "
+                f"auto_start={auto_start} auto_update={auto_update} auto_restart={auto_restart} "
                 f"restart_after_stop={restart_after_stop} stop_time='{normalized_stop_time or '-'}'"
             ),
         )
@@ -1180,6 +1288,7 @@ async def _create_template_action(
     restart_after_stop: bool,
     username: str = "",
     password: str = "",
+    auto_start: bool = False,
 ) -> Tuple[bool, str]:
     name = sanitize_instance_id(template_name)
     if not template_name.strip():
@@ -1203,6 +1312,7 @@ async def _create_template_action(
             app_id=app_id.strip(),
             executable=executable.strip(),
             parameters=param_list,
+            auto_start=bool(auto_start),
             auto_update=bool(auto_update),
             auto_restart=bool(auto_restart),
             stop_time=stop,
@@ -1217,6 +1327,33 @@ async def _create_template_action(
     except Exception as exc:
         write_action_log("ui_createtemplate", name, "failed", str(exc))
         _schedule_discord_refresh()
+        return False, str(exc)
+
+
+async def _import_wgsm_plugin_action(
+    source: str,
+    template_name: str = "",
+    *,
+    allow_local: bool = True,
+) -> Tuple[bool, str]:
+    source_value = str(source or "").strip()
+    if not source_value:
+        return False, "WindowsGSM plugin source required"
+    try:
+        report = await asyncio.to_thread(
+            import_wgsm_plugin,
+            source_value,
+            PLUGIN_TEMPLATES_DIR,
+            template_name=str(template_name or "").strip(),
+            allow_local=allow_local,
+        )
+        message = format_import_summary(report)
+        write_action_log("ui_importwgsm", str(report.get("template_name", "-")), "success", message)
+        _schedule_discord_refresh()
+        return True, message
+    except Exception as exc:
+        logging.exception("WindowsGSM plugin import failed")
+        write_action_log("ui_importwgsm", str(template_name or "-") or "-", "failed", str(exc))
         return False, str(exc)
 
 
@@ -1589,22 +1726,23 @@ if QApplication is not None:
         def __init__(self) -> None:
             super().__init__()
             self.setObjectName("topBar")
-            self.setMinimumHeight(142)
+            self.setMinimumHeight(106)
+            self.setMaximumHeight(126)
             _apply_soft_shadow(self, blur=30, dx=6, dy=6, alpha=170)
 
             root = QHBoxLayout(self)
-            root.setContentsMargins(14, 12, 14, 12)
-            root.setSpacing(12)
+            root.setContentsMargins(12, 8, 12, 8)
+            root.setSpacing(10)
 
             left = QVBoxLayout()
             left.setSpacing(4)
             self.brand_logo = QLabel()
             self.brand_logo.setObjectName("brandLogo")
-            self.brand_logo.setMinimumHeight(112)
-            self.brand_logo.setMaximumHeight(124)
+            self.brand_logo.setMinimumHeight(56)
+            self.brand_logo.setMaximumHeight(64)
             self.brand_logo.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.brand_logo.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            logo = _load_logo_pixmap(112)
+            logo = _load_logo_pixmap(60)
             if logo is not None:
                 self.brand_logo.setPixmap(logo)
             else:
@@ -1616,29 +1754,42 @@ if QApplication is not None:
             left.addWidget(self.summary_label)
             root.addLayout(left, 1)
 
-            actions = QHBoxLayout()
+            actions = QGridLayout()
+            actions.setHorizontalSpacing(6)
+            actions.setVerticalSpacing(5)
             self.buttons: Dict[str, QPushButton] = {}
-            self._add(actions, "start", "Start", "primaryButton")
-            self._add(actions, "stop", "Stop", "dangerButton")
-            self._add(actions, "restart", "Restart")
-            self._add(actions, "update", "Update")
-            self._add(actions, "tools", "Tools")
-            self._add(actions, "save", "Save CFG")
-            self._add(actions, "refresh", "Refresh", "ghostButton")
+            self._add(actions, "start", "Start", 0, 0, "primaryButton")
+            self._add(actions, "stop", "Stop", 0, 1, "dangerButton")
+            self._add(actions, "restart", "Restart", 0, 2)
+            self._add(actions, "update", "Update", 0, 3)
+            self._add(actions, "tools", "Tools", 1, 0)
+            self._add(actions, "save", "Save CFG", 1, 1)
+            self._add(actions, "refresh", "Refresh", 1, 2, "ghostButton")
+            actions.setColumnStretch(3, 1)
 
             right = QVBoxLayout()
+            right.setSpacing(4)
             right.addLayout(actions)
             self.selected_label = QLabel("Selected: -")
             self.selected_label.setObjectName("selectedLine")
             right.addWidget(self.selected_label, alignment=Qt.AlignmentFlag.AlignRight)
             root.addLayout(right)
 
-        def _add(self, layout: QHBoxLayout, key: str, label: str, object_name: str = "") -> None:
+        def _add(
+            self,
+            layout: QGridLayout,
+            key: str,
+            label: str,
+            row: int,
+            column: int,
+            object_name: str = "",
+        ) -> None:
             btn = QPushButton(label)
+            btn.setMinimumHeight(30)
             if object_name:
                 btn.setObjectName(object_name)
             btn.clicked.connect(lambda _checked=False, v=key: self.action_requested.emit(v))
-            layout.addWidget(btn)
+            layout.addWidget(btn, row, column)
             self.buttons[key] = btn
 
         def set_summary(self, running: int, stopped: int, updating: int) -> None:
@@ -1651,7 +1802,6 @@ if QApplication is not None:
             for key, button in self.buttons.items():
                 button.setEnabled(bool(states.get(key, False)))
 
-
     class MetricsPanel(QFrame):
         def __init__(self) -> None:
             super().__init__()
@@ -1660,20 +1810,20 @@ if QApplication is not None:
             row.setContentsMargins(2, 0, 2, 0)
             row.setSpacing(8)
             self.values: Dict[str, QLabel] = {}
-            self._add_metric(row, "cpu", "CPU")
-            self._add_metric(row, "ram", "RAM")
-            self._add_metric(row, "disk", "Disk")
-            self._add_metric(row, "network", "Network")
+            self._add_metric(row, "dgsm", "DGSM")
+            self._add_metric(row, "game_servers", "Game Servers")
+            self._add_metric(row, "server_io", "Server I/O")
+            self._add_metric(row, "players", "Players")
             self._add_metric(row, "servers", "Running")
-            self._add_metric(row, "uptime", "Uptime")
+            self._add_metric(row, "uptime", "DGSM Uptime")
 
         def _add_metric(self, row: QHBoxLayout, key: str, title: str) -> None:
             tile = QFrame()
             tile.setObjectName("metricTile")
             _apply_soft_shadow(tile, blur=20, dx=4, dy=4, alpha=145)
             layout = QVBoxLayout(tile)
-            layout.setContentsMargins(10, 8, 10, 8)
-            layout.setSpacing(3)
+            layout.setContentsMargins(9, 5, 9, 5)
+            layout.setSpacing(2)
             title_lbl = QLabel(title)
             title_lbl.setObjectName("metricTitle")
             value_lbl = QLabel("--")
@@ -1695,6 +1845,7 @@ if QApplication is not None:
         def __init__(self, row: Dict[str, object]) -> None:
             super().__init__()
             self.server_name = str(row.get("name", ""))
+            self._selected = False
             self.setObjectName("serverCard")
             self.setProperty("selected", "false")
             _apply_soft_shadow(self, blur=22, dx=4, dy=4, alpha=160)
@@ -1720,6 +1871,15 @@ if QApplication is not None:
             self.feedback_label.setObjectName("serverFeedback")
             left.addWidget(self.detail_label)
             left.addWidget(self.feedback_label)
+            self.resource_label = QLabel("")
+            self.resource_label.setObjectName("serverDetail")
+            self.resource_label.setWordWrap(True)
+            left.addWidget(self.resource_label)
+            self.rest_label = QLabel("")
+            self.rest_label.setObjectName("serverDetail")
+            self.rest_label.setWordWrap(True)
+            self.rest_label.setVisible(False)
+            left.addWidget(self.rest_label)
             root.addLayout(left, 1)
 
             actions = QHBoxLayout()
@@ -1743,6 +1903,29 @@ if QApplication is not None:
             root.addLayout(actions)
             self.update_row(row)
 
+        def _rest_text(self, row: Dict[str, object]) -> str:
+            rest = row.get("rest")
+            if not isinstance(rest, dict):
+                return ""
+            if not rest.get("configured"):
+                return ""
+            if not rest.get("enabled"):
+                return ""
+
+            lines = rest.get("summary")
+            if isinstance(lines, list) and lines:
+                return "REST API: " + " | ".join(_clean(str(item), 80) for item in lines[:6])
+
+            errors = rest.get("errors")
+            if isinstance(errors, dict) and errors:
+                first_key = sorted(str(key) for key in errors.keys())[0]
+                return f"REST API: {first_key}: {_clean(str(errors.get(first_key)), 100)}"
+            return "REST API: no data"
+
+        def _update_rest_visibility(self) -> None:
+            text = self.rest_label.text().strip()
+            self.rest_label.setVisible(bool(self._selected and text))
+
         def _btn(self, label: str, action: str, object_name: str = "") -> QPushButton:
             btn = QPushButton(label)
             btn.setFixedHeight(31)
@@ -1761,6 +1944,18 @@ if QApplication is not None:
             self.name_label.setText(self.server_name)
             self.detail_label.setText(_clean(str(row.get("detail", "")), 140))
             self.feedback_label.setText(_clean(str(row.get("feedback", "")), 180))
+            resources = row.get("resources")
+            if running and isinstance(resources, dict) and resources:
+                self.resource_label.setText(
+                    f"Resources: {float(resources.get('cpu', 0.0) or 0.0):.1f}% CPU | "
+                    f"{_human_bytes(int(resources.get('rss', 0) or 0))} RAM | "
+                    f"I/O R {_human_bytes(float(resources.get('read_bps', 0.0) or 0.0))}/s "
+                    f"W {_human_bytes(float(resources.get('write_bps', 0.0) or 0.0))}/s"
+                )
+            else:
+                self.resource_label.setText("")
+            self.rest_label.setText(self._rest_text(row))
+            self._update_rest_visibility()
 
             badge = "running" if state == "running" else ("updating" if state == "updating" else ("failed" if state == "failed" else "stopped"))
             self.status_badge.setProperty("state", badge)
@@ -1777,9 +1972,11 @@ if QApplication is not None:
             self.remove_btn.setEnabled(not busy)
 
         def set_selected(self, selected: bool) -> None:
+            self._selected = bool(selected)
             self.setProperty("selected", "true" if selected else "false")
             self.style().unpolish(self)
             self.style().polish(self)
+            self._update_rest_visibility()
 
         def mousePressEvent(self, event) -> None:  # type: ignore[override]
             self.selected.emit(self.server_name)
@@ -1840,10 +2037,11 @@ if QApplication is not None:
 
             checks = QHBoxLayout()
             checks.setSpacing(10)
+            self.auto_start = QCheckBox("Auto start")
             self.auto_restart = QCheckBox("Auto restart")
             self.auto_update = QCheckBox("Auto update")
             self.restart_after_stop = QCheckBox("Restart after stop")
-            for c in (self.auto_restart, self.auto_update, self.restart_after_stop):
+            for c in (self.auto_start, self.auto_restart, self.auto_update, self.restart_after_stop):
                 checks.addWidget(c)
             checks.addStretch(1)
             form_layout.addLayout(checks)
@@ -1859,7 +2057,7 @@ if QApplication is not None:
 
             for widget in (self.exec_input, self.params_input, self.stop_input):
                 widget.textChanged.connect(self._emit_changed)
-            for widget in (self.auto_update, self.auto_restart, self.restart_after_stop):
+            for widget in (self.auto_start, self.auto_update, self.auto_restart, self.restart_after_stop):
                 widget.toggled.connect(self._emit_changed)
 
         def _emit_changed(self, *_args) -> None:
@@ -1874,9 +2072,15 @@ if QApplication is not None:
             try:
                 self.server_label.setText(f"Selected: {name}")
                 self.unsaved_label.setText("")
-                self.exec_input.setText(str(settings.get("executable", "") or ""))
-                self.params_input.setText(str(settings.get("parameters", "") or ""))
-                self.stop_input.setText(str(settings.get("stop_time", "") or ""))
+                text_values = (
+                    (self.exec_input, str(settings.get("executable", "") or "")),
+                    (self.params_input, str(settings.get("parameters", "") or "")),
+                    (self.stop_input, str(settings.get("stop_time", "") or "")),
+                )
+                for widget, value in text_values:
+                    if widget.text() != value:
+                        widget.setText(value)
+                self.auto_start.setChecked(bool(settings.get("auto_start", False)))
                 self.auto_update.setChecked(bool(settings.get("auto_update", False)))
                 self.auto_restart.setChecked(bool(settings.get("auto_restart", True)))
                 self.restart_after_stop.setChecked(bool(settings.get("restart_after_stop", False)))
@@ -1891,6 +2095,7 @@ if QApplication is not None:
                 self.exec_input.setText("")
                 self.params_input.setText("")
                 self.stop_input.setText("")
+                self.auto_start.setChecked(False)
                 self.auto_update.setChecked(False)
                 self.auto_restart.setChecked(True)
                 self.restart_after_stop.setChecked(False)
@@ -1901,6 +2106,7 @@ if QApplication is not None:
             return {
                 "executable": self.exec_input.text().strip(),
                 "parameters": self.params_input.text().strip(),
+                "auto_start": bool(self.auto_start.isChecked()),
                 "auto_update": bool(self.auto_update.isChecked()),
                 "auto_restart": bool(self.auto_restart.isChecked()),
                 "restart_after_stop": bool(self.restart_after_stop.isChecked()),
@@ -1956,6 +2162,7 @@ if QApplication is not None:
 
     class LogPanel(QFrame):
         clear_requested = Signal()
+        cli_submitted = Signal(str)
 
         def __init__(self) -> None:
             super().__init__()
@@ -1991,10 +2198,39 @@ if QApplication is not None:
             self.output.setFont(font)
             root.addWidget(self.output, 1)
 
+            cli_row = QHBoxLayout()
+            cli_row.setSpacing(8)
+            cli_label = QLabel("CLI")
+            cli_label.setObjectName("meta")
+            cli_row.addWidget(cli_label)
+            self.cli_input = QLineEdit()
+            self.cli_input.setPlaceholderText(
+                "help | list | status [server] | start <server> | stop <server> | restart <server> | update <server>"
+            )
+            self.cli_input.returnPressed.connect(self._submit_cli)
+            cli_row.addWidget(self.cli_input, 1)
+            self.cli_run_btn = QPushButton("Run")
+            self.cli_run_btn.setObjectName("primaryButton")
+            self.cli_run_btn.clicked.connect(self._submit_cli)
+            cli_row.addWidget(self.cli_run_btn)
+            root.addLayout(cli_row)
+
         def copy_all(self) -> None:
             data = self.output.toPlainText().strip()
             if data:
                 QApplication.clipboard().setText(data)
+
+        def _submit_cli(self) -> None:
+            cmd = self.cli_input.text().strip()
+            if not cmd:
+                return
+            self.cli_submitted.emit(cmd)
+            self.cli_input.clear()
+
+        def set_cli_enabled(self, enabled: bool) -> None:
+            state = bool(enabled)
+            self.cli_input.setEnabled(state)
+            self.cli_run_btn.setEnabled(state)
 
         def set_lines(self, lines: List[str]) -> None:
             signature = (len(lines), lines[-1] if lines else "")
@@ -2044,7 +2280,7 @@ if QApplication is not None:
             self.setMinimumSize(760, 520)
 
             QTimer.singleShot(120, self._init_split_sizes)
-            QTimer.singleShot(150, self.refresh_data)
+            QTimer.singleShot(150, lambda: self.refresh_data(reload_config=True))
             self.refresh_timer = QTimer(self)
             self.refresh_timer.timeout.connect(self.refresh_data)
             self.refresh_timer.start(1200)
@@ -2065,8 +2301,8 @@ if QApplication is not None:
         def _build_ui(self) -> None:
             root = QWidget()
             outer = QVBoxLayout(root)
-            outer.setContentsMargins(14, 14, 14, 14)
-            outer.setSpacing(10)
+            outer.setContentsMargins(10, 10, 10, 10)
+            outer.setSpacing(8)
 
             self.topbar = TopControlBar()
             self.topbar.action_requested.connect(self._handle_top_action)
@@ -2086,6 +2322,7 @@ if QApplication is not None:
             self.server_list_card = QFrame()
             self.server_list_card.setObjectName("serverListCard")
             self.server_list_card.setMinimumWidth(320)
+            self.server_list_card.setMinimumHeight(180)
             self.server_list_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             _apply_soft_shadow(self.server_list_card, blur=26, dx=5, dy=5, alpha=170)
             server_layout = QVBoxLayout(self.server_list_card)
@@ -2120,16 +2357,21 @@ if QApplication is not None:
             self.vertical_split.addWidget(self.bottom_split)
 
             self.settings_panel = SettingsPanel()
+            self.settings_panel.setMinimumHeight(100)
+            self.settings_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
             self.settings_panel.changed.connect(self._on_settings_changed)
             self.settings_panel.save_requested.connect(self.on_savecfg)
             self.bottom_split.addWidget(self.settings_panel)
 
             self.log_panel = LogPanel()
+            self.log_panel.setMinimumHeight(100)
+            self.log_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
             self.log_panel.clear_requested.connect(self.on_clear_console)
+            self.log_panel.cli_submitted.connect(self.on_cli_submit)
             self.bottom_split.addWidget(self.log_panel)
             self.bottom_split.setStretchFactor(0, 1)
             self.bottom_split.setStretchFactor(1, 2)
-            self.vertical_split.setStretchFactor(0, 3)
+            self.vertical_split.setStretchFactor(0, 5)
             self.vertical_split.setStretchFactor(1, 4)
 
             self.status_card = QFrame()
@@ -2173,18 +2415,22 @@ if QApplication is not None:
             # Keep panels usable even after long runtime or RDP resolution changes.
             h = max(1, self.vertical_split.height())
             top_sizes = self.vertical_split.sizes()
+            if h < 240:
+                min_top = max(1, int(h * 0.54))
+                min_bottom = max(1, h - min_top)
+            else:
+                min_top = min(240, max(150, int(h * 0.42)))
+                min_bottom = min(210, max(100, int(h * 0.28)))
             if len(top_sizes) != 2 or force_defaults or sum(top_sizes) <= 0:
-                top_h = int(max(220, min(h * 0.42, h - 280)))
+                top_h = int(max(min_top, min(h * 0.58, h - min_bottom)))
                 current_top = top_h
-                current_bottom = max(260, h - top_h)
+                current_bottom = max(1, h - top_h)
             else:
                 current_top = int(top_sizes[0])
                 current_bottom = int(top_sizes[1])
                 top_h = current_top
-            min_top = 180
-            min_bottom = 260
             top_h = max(min_top, min(top_h, max(min_top, h - min_bottom)))
-            bottom_h = max(min_bottom, h - top_h)
+            bottom_h = max(1, h - top_h)
             if force_defaults or abs(top_h - current_top) > 6 or abs(bottom_h - current_bottom) > 6:
                 self.vertical_split.setSizes([top_h, bottom_h])
 
@@ -2278,7 +2524,7 @@ if QApplication is not None:
 
         def _handle_top_action(self, action: str) -> None:
             if action == "refresh":
-                self.refresh_data()
+                self.refresh_data(reload_config=True)
                 return
             if action == "save":
                 self.on_savecfg()
@@ -2370,7 +2616,7 @@ if QApplication is not None:
                 return
 
         def _on_settings_changed(self) -> None:
-            if self.selected_server is None or self.action_in_flight:
+            if self.selected_server is None:
                 return
             self.settings_dirty = True
             self.settings_loaded_for = self.selected_server
@@ -2479,6 +2725,7 @@ if QApplication is not None:
                     name=name,
                     executable=str(payload["executable"]),
                     parameters=str(payload["parameters"]),
+                    auto_start=bool(payload["auto_start"]),
                     auto_update=bool(payload["auto_update"]),
                     auto_restart=bool(payload["auto_restart"]),
                     restart_after_stop=bool(payload["restart_after_stop"]),
@@ -2492,6 +2739,14 @@ if QApplication is not None:
             _LIVE_LOG_LINES.clear()
             self.log_panel.set_lines([])
             self.set_status("Console output cleared")
+
+        def on_cli_submit(self, command_line: str) -> None:
+            cmd = str(command_line or "").strip()
+            if not cmd:
+                self.set_status("CLI command is empty")
+                return
+            _LIVE_LOG_LINES.append(f"[CLI] > {_clean(cmd, 220)}")
+            self._queue_async("CLI", lambda: _run_cli_user_command(cmd), timeout=300.0)
 
         def on_tools(self) -> None:
             existing = getattr(self, "_tools_dialog", None)
@@ -2518,6 +2773,7 @@ if QApplication is not None:
                 layout.addWidget(btn)
 
             _tool_button("Create Template", self._tool_create_template)
+            _tool_button("Import WindowsGSM Plugin", self._tool_import_wgsm_plugin)
             _tool_button("Add Server", self._tool_add_server)
             _tool_button("Create Backup", self._tool_create_backup)
             _tool_button("Restore Backup", self._tool_restore_backup)
@@ -2580,6 +2836,16 @@ if QApplication is not None:
                 )
                 == QMessageBox.StandardButton.Yes
             )
+            auto_start = (
+                QMessageBox.question(
+                    self,
+                    "Auto start",
+                    "Start automatically when DGSM starts?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                == QMessageBox.StandardButton.Yes
+            )
 
             self._queue_async(
                 "CREATE TEMPLATE",
@@ -2588,12 +2854,38 @@ if QApplication is not None:
                     app_id=str(app_id).strip(),
                     executable=str(executable).strip(),
                     parameters=str(params).strip(),
+                    auto_start=auto_start,
                     auto_update=auto_update,
                     auto_restart=auto_restart,
                     stop_time=str(stop_time).strip(),
                     restart_after_stop=restart_after_stop,
                 ),
                 timeout=60.0,
+            )
+
+        def _tool_import_wgsm_plugin(self) -> None:
+            source, ok = QInputDialog.getText(
+                self,
+                "Import WindowsGSM Plugin",
+                "Local .cs/.zip/folder or HTTPS GitHub URL:",
+            )
+            if not ok or not str(source).strip():
+                return
+            template_name, ok = QInputDialog.getText(
+                self,
+                "Import WindowsGSM Plugin",
+                "Optional DGSM template name (WGSM_ prefix is added):",
+            )
+            if not ok:
+                return
+            self._queue_async(
+                "IMPORT WGSM",
+                lambda: _import_wgsm_plugin_action(
+                    source=str(source).strip(),
+                    template_name=str(template_name).strip(),
+                    allow_local=True,
+                ),
+                timeout=120.0,
             )
 
         def _tool_add_server(self) -> None:
@@ -2712,12 +3004,12 @@ if QApplication is not None:
                 timeout=180.0,
             )
 
-        def refresh_data(self) -> None:
+        def refresh_data(self, reload_config: bool = False) -> None:
             if self._closing:
                 return
             if self._refresh_task is not None and not self._refresh_task.done():
                 return
-            self._refresh_task = asyncio.create_task(_collect_servers())
+            self._refresh_task = asyncio.create_task(_collect_servers(reload_config=reload_config))
 
             def done_callback(task: asyncio.Task) -> None:
                 if self._closing:
@@ -2786,7 +3078,7 @@ if QApplication is not None:
             else:
                 if self.settings_dirty and self.settings_loaded_for == self.selected_server:
                     self.settings_panel.set_dirty(True)
-                else:
+                elif self.settings_loaded_for != self.selected_server:
                     self._load_selected_settings(force=False)
             self._update_header_and_buttons()
 
@@ -2819,6 +3111,7 @@ if QApplication is not None:
                 "save": False,
                 "refresh": True,
             }
+            self.log_panel.set_cli_enabled(not self.action_in_flight)
             if self.action_in_flight:
                 states["refresh"] = False
                 states["tools"] = False
