@@ -67,7 +67,7 @@ def load_server_configs():
         settings_file = os.path.join(path, "server_settings.json")
         if os.path.exists(settings_file):
             try:
-                with open(settings_file, "r", encoding="utf-8") as f:
+                with open(settings_file, "r", encoding="utf-8-sig") as f:
                     SERVER_CONFIGS[name] = json.load(f)
             except Exception:
                 SERVER_CONFIGS[name] = {}

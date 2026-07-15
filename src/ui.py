@@ -32,6 +32,12 @@ async def safe_inter_defer(inter: discord.Interaction, ephemeral: bool = True) -
 async def safe_inter_send(inter: discord.Interaction, content: str, *, ephemeral: bool = True):
     message = content or ""
 
+    async def _complete_deferred_response():
+        try:
+            return await inter.edit_original_response(content=message)
+        except discord.NotFound:
+            return await inter.followup.send(message, ephemeral=ephemeral)
+
     async def _channel_fallback():
         try:
             if ephemeral:
@@ -46,7 +52,7 @@ async def safe_inter_send(inter: discord.Interaction, content: str, *, ephemeral
 
     try:
         if inter.response.is_done():
-            return await inter.followup.send(message, ephemeral=ephemeral)
+            return await _complete_deferred_response()
         else:
             return await inter.response.send_message(message, ephemeral=ephemeral)
     except discord.NotFound:
@@ -261,6 +267,7 @@ class ServerControlView(discord.ui.View):
         self.add_item(RefreshButton())
         row = 1
         cnt = 0
+        server_buttons = []
         for n in SERVER_PATHS:
             running = False
             try:
@@ -277,15 +284,26 @@ class ServerControlView(discord.ui.View):
                 style = discord.ButtonStyle.gray
 
             button_disabled = (not self.access) or busy
+            update_disabled = (not self.access) or busy or running
+            server_buttons.append((n, style, button_disabled, update_disabled))
+
+        # Keep the primary start/stop controls together, followed by all updates.
+        for n, style, button_disabled, _update_disabled in server_buttons:
             self.add_item(ServerButton(n, style, row=row, disabled=button_disabled))
             cnt += 1
-            if get_config_value(n, "app_id"):
-                if cnt >= 5:
-                    row += 1
-                    cnt = 0
-                update_disabled = (not self.access) or busy or running
-                self.add_item(UpdateButton(n, row=row, disabled=update_disabled))
-                cnt += 1
+            if cnt >= 5:
+                row += 1
+                cnt = 0
+
+        if cnt:
+            row += 1
+            cnt = 0
+
+        for n, _style, _button_disabled, update_disabled in server_buttons:
+            if not get_config_value(n, "app_id"):
+                continue
+            self.add_item(UpdateButton(n, row=row, disabled=update_disabled))
+            cnt += 1
             if cnt >= 5:
                 row += 1
                 cnt = 0

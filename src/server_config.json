@@ -1,8 +1,0 @@
-{
-    "log_retention_days": 7,
-    "health_check_interval": 5,
-    "force_recover_on_start": true,
-    "check_ports": true,
-    "server_paths": {
-        }
-}

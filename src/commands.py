@@ -51,6 +51,8 @@ from runtime_status import (
     clear_server_status,
     get_operation_status,
 )
+from cli_commands import execute_cli_command
+from wgsm_import import format_import_summary, import_wgsm_plugin
 
 
 # ---------- helper: robust defer & reply ----------
@@ -126,6 +128,22 @@ async def safe_send(ctx: discord.ApplicationContext, content: Optional[str] = No
     except Exception as e:
         logging.warning(f"safe_send failed: {e}")
         return await _channel_fallback()
+
+
+def _trim_text(value: str, limit: int = 1700) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _render_cli_reply(command_line: str, payload: str, ok: bool) -> str:
+    icon = "✅" if ok else "❌"
+    cmd = _trim_text(command_line, 200)
+    output = _trim_text(payload, 1700)
+    if "\n" in output:
+        return f"{icon} CLI `{cmd}`\n```text\n{output}\n```"
+    return f"{icon} CLI `{cmd}`\n{output}"
 
 
 async def refresh_main_panel(user=None):
@@ -475,6 +493,7 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
         "password",
         "instance_id",
         "install_dir",
+        "auto_start",
         "auto_update",
         "auto_restart",
         "stop_time",
@@ -485,10 +504,12 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
         "executable_windows",
         "executable_linux",
         "parameters",
+        "auto_start",
         "auto_update",
         "auto_restart",
         "stop_time",
         "restart_after_stop",
+        "rest_api",
     ]
     try:
         if section == "config":
@@ -502,7 +523,7 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
                 sf = os.path.join(SERVER_PATHS[name], "server_settings.json")
                 if os.path.exists(sf):
                     try:
-                        with open(sf, "r", encoding="utf-8") as f:
+                        with open(sf, "r", encoding="utf-8-sig") as f:
                             existing = json.load(f)
                         keys = list(set(keys + list(existing.keys())))
                     except Exception:
@@ -577,6 +598,7 @@ async def create_template(
     app_id: str,
     executable: Option(str, "Server executable (optional)", required=False, default=""),
     parameters: Option(str, "Startparameter (z.B. -port=25565 -maxplayers=20)", required=False),
+    auto_start: Option(bool, "Automatischer Start beim DGSM-Start", default=False),
     auto_update: Option(bool, "Automatische Updates aktivieren", default=True),
     auto_restart: Option(bool, "Automatischer Neustart bei Absturz", default=True),
     stop_time: Option(str, "Tägliche Stoppzeit (HH:MM)", default="05:00"),
@@ -592,6 +614,7 @@ async def create_template(
             app_id=app_id,
             executable=executable or "",
             parameters=param_list,
+            auto_start=auto_start,
             auto_update=auto_update,
             auto_restart=auto_restart,
             stop_time=stop_time,
@@ -603,6 +626,36 @@ async def create_template(
         await safe_send(ctx, f"✅ Template '{template_name}' erstellt/aktualisiert.", ephemeral=True)
     except Exception as e:
         await safe_send(ctx, f"❌ Fehler: {e}", ephemeral=True)
+
+
+@bot.slash_command(name="importwgsm", description="Importiert ein WindowsGSM-Plugin als DGSM-Template")
+@commands.has_role("Admin")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def import_windowsgsm_plugin(
+    ctx: discord.ApplicationContext,
+    source_url: Option(str, "HTTPS GitHub repository, .cs or plugin ZIP URL"),
+    template_name: Option(str, "Optionaler DGSM-Template-Name", required=False, default=""),
+):
+    await safe_defer(ctx, ephemeral=True)
+    try:
+        report = await asyncio.to_thread(
+            import_wgsm_plugin,
+            source_url,
+            PLUGIN_TEMPLATES_DIR,
+            template_name=template_name or "",
+            allow_local=False,
+        )
+        summary = format_import_summary(report)
+        warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
+        warning_text = ""
+        if warnings:
+            warning_text = "\n" + "\n".join(f"- {str(item)[:180]}" for item in warnings[:4])
+        write_action_log("importwgsm", str(report.get("template_name", "-")), "success", summary)
+        await safe_send(ctx, f"✅ WindowsGSM-Import abgeschlossen:\n`{summary}`{warning_text}", ephemeral=True)
+    except Exception as exc:
+        logging.exception("WindowsGSM plugin import failed")
+        write_action_log("importwgsm", template_name or "-", "failed", str(exc))
+        await safe_send(ctx, f"❌ WindowsGSM-Import fehlgeschlagen: {exc}", ephemeral=True)
 
 
 @bot.slash_command(name="addserver", description="Installiert einen neuen Server aus einem Template")
@@ -767,7 +820,7 @@ async def update_server(
         load_server_configs()
     else:
         sf = os.path.join(SERVER_PATHS[server], "server_settings.json")
-        s_cfg = json.load(open(sf, "r", encoding="utf-8")) if os.path.exists(sf) else {}
+        s_cfg = json.load(open(sf, "r", encoding="utf-8-sig")) if os.path.exists(sf) else {}
         s_cfg[key] = new_val
         json.dump(s_cfg, open(sf, "w", encoding="utf-8"), indent=4)
         load_server_configs()
@@ -1095,3 +1148,22 @@ async def show_logs(ctx: discord.ApplicationContext, server: Optional[str] = Non
     for ts, act, srv, st, det in rows:
         eb.add_field(name=f"{ts} | {act.upper()} | {srv}", value=f"Status: {st}\n{det or '-'}", inline=False)
     await safe_send(ctx, embed=eb, ephemeral=True)
+
+
+@bot.slash_command(name="cli", description="Optionale DGSM-CLI (Discord bleibt Hauptsteuerung)")
+@commands.has_role("Admin")
+@commands.cooldown(3, 6, commands.BucketType.user)
+async def run_cli_command(
+    ctx: discord.ApplicationContext,
+    command: Option(str, "CLI-Kommando (help/list/status/start/stop/restart/update/refresh)"),
+):
+    await safe_defer(ctx, ephemeral=True)
+    cmd = str(command or "").strip()
+    if not cmd:
+        return await safe_send(ctx, "❌ Bitte ein CLI-Kommando angeben.", ephemeral=True)
+
+    actor = getattr(getattr(ctx, "author", None), "id", "unknown")
+    result = await execute_cli_command(cmd, source=f"discord:{actor}")
+    if result.refresh:
+        await refresh_main_panel(user=getattr(ctx, "user", None))
+    await safe_send(ctx, _render_cli_reply(cmd, result.message, result.ok), ephemeral=True)
