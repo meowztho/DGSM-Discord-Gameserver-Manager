@@ -1,5 +1,7 @@
 {
     "executable": "RustDedicated.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "+server.port",
         "28015",
@@ -24,6 +26,7 @@
         "-logfile",
         "output_log.txt"
     ],
+    "auto_start": false,
     "auto_update": true,
     "auto_restart": true,
     "stop_time": "05:00",

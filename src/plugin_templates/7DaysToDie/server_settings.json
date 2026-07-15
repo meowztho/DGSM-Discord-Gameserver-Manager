@@ -1,5 +1,7 @@
 {
     "executable": "7DaysToDieServer.exe",
+    "executable_windows": "",
+    "executable_linux": "",
     "parameters": [
         "-quit",
         "-batchmode",
@@ -9,6 +11,7 @@
         "-logfile",
         "output_log.txt"
     ],
+    "auto_start": false,
     "auto_update": true,
     "auto_restart": true,
     "stop_time": "05:00",

@@ -1,4 +1,4 @@
-# DGSM – Discord Gameserver Manager
+﻿# DGSM – Discord Gameserver Manager
 ## for Windows and Linux(untested).
 
 ![Python](https://img.shields.io/badge/Python-blue?logo=python&logoColor=white)
@@ -47,7 +47,8 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Create ZIP backups via `/createbackup`
 - Restore server data from ZIP backups via `/restorebackup`
 - Live operation states in UI (start/stop/update/backup/restore)
-- Optional auto-update and scheduled restart
+- Optional auto-start on boot, auto-update and scheduled restart
+- Non-Steam installs via templates: Minecraft **Vanilla**, **Fabric** and **Bedrock** (bundled Java, no host setup)
 - Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
 - Role & permission checks for admin actions
 - SQLite logging, JSON configuration
@@ -56,6 +57,17 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Runs on Windows and Linux servers
 - Keeps existing templates usable with OS-specific executable fallback
 - Normalized template JSON schema across all `plugin_templates`
+- Static WindowsGSM plugin import for creating reviewed DGSM templates without executing foreign C# code
+
+---
+
+## Obsidian Vault
+
+You can open the repository root directly in Obsidian as a vault.
+
+- Start with `00-Obsidian-Start.md`
+- Project notes live in `obsidian/`
+- The shared vault setup is stored in `.obsidian/`
 
 ---
 
@@ -202,6 +214,8 @@ Supported commands:
 - `stop <server>`
 - `restart <server>`
 - `update <server>`
+- `api <server> list`
+- `api <server> <command> [arguments]`
 - `refresh`
 
 Examples:
@@ -210,6 +224,7 @@ Examples:
 /cli command:"list"
 /cli command:"status Palworld-main"
 /cli command:"restart Palworld-main"
+/cli command:"api Palworld-main save"
 ```
 
 In desktop UI Live Log CLI bar:
@@ -218,13 +233,20 @@ In desktop UI Live Log CLI bar:
 list
 status Palworld-main
 update Palworld-main
+api Palworld-main list
+api Palworld-main announce "Restart in 10 minutes"
 ```
+
+API commands are read from the selected server's `rest_api.actions.commands`
+allowlist. Discord `/cli`, Desktop UI and Web UI all use the same dispatcher.
+Lifecycle operations such as start, stop, restart and update always remain DGSM
+commands and cannot be redirected to a game REST API.
 
 ---
 
 ## 🖥️ Local Desktop UI (Addon)
 
-DGSM includes a local desktop control window for Windows and Linux (PySide6 required).
+DGSM includes a local desktop control window for Windows and Linux (PySide6 required) and an optional local browser UI.
 
 - Starts automatically together with the bot
 - Uses **PySide6 (Qt for Python)** with a modern dark Soft-UI style
@@ -236,6 +258,7 @@ DGSM includes a local desktop control window for Windows and Linux (PySide6 requ
 - Settings changed in desktop UI are pushed to Discord status panel refresh
 - Unsaved setting edits stay in the form until you press `SAVE CFG`
 - Linux note: a graphical display/session is required for the UI window (headless servers can use Discord-only mode).
+- Browser UI note: the web server rejects non-local-network clients and is disabled by default.
 
 Dependency note:
 
@@ -249,9 +272,28 @@ Environment toggle:
 
 ```env
 DGSM_DESKTOP_UI_ENABLED=true
+DGSM_WEB_UI_ENABLED=false
+DGSM_WEB_UI_HOST=127.0.0.1
+DGSM_WEB_UI_PORT=8765
+DGSM_WEB_UI_LOCAL_NETWORK_ONLY=true
 ```
 
 Set it to `false` to disable the desktop window.
+
+Set `DGSM_WEB_UI_ENABLED=true` to enable browser access. With the default host it is reachable only on the same machine:
+
+```text
+http://127.0.0.1:8765
+```
+
+For LAN access, bind it to the server's LAN IP or `0.0.0.0`:
+
+```env
+DGSM_WEB_UI_HOST=0.0.0.0
+```
+
+The request filter still allows only loopback, private LAN, and link-local client IPs by default.
+Set `DGSM_WEB_UI_LOCAL_NETWORK_ONLY=false` to disable that client-IP filter.
 
 Optional: hide the separate console window while desktop UI is open:
 
@@ -382,6 +424,23 @@ Behavior summary:
 - DGSM automatically detects a suitable start file on Windows/Linux and writes it back as a hint.
 - You can still set `executable_windows` / `executable_linux` explicitly for exact control.
 
+#### WindowsGSM plugin import
+
+DGSM can statically inspect a WindowsGSM `.cs` file, ZIP archive, GitHub repository,
+or local plugin folder and create a normalized template. Use **Import WindowsGSM Plugin**
+in the Desktop/Web tools or the admin-only Discord command `/importwgsm`.
+
+- SteamCMD plugins with an App ID and start path become normal DGSM templates.
+- C# code is never compiled or executed. DGSM keeps its own install/update/start/stop logic.
+- Custom installers become blocked review templates and require a reviewed native `install.py`.
+- `windowsgsm_import.json` records the source hash, extracted fields, compatibility, and warnings.
+- Discord and Web imports accept public HTTPS URLs only; local paths are Desktop UI only.
+
+See [`docs/WINDOWSGSM_IMPORT.md`](docs/WINDOWSGSM_IMPORT.md) for the compatibility rules and workflow.
+
+The optional REST bridge, resource metrics and API command allowlist are documented
+in [`docs/REST_API_BRIDGE.md`](docs/REST_API_BRIDGE.md).
+
 Template schema (normalized):
 
 ```json
@@ -390,6 +449,7 @@ Template schema (normalized):
   "executable": "PalServer.exe",
   "executable_windows": "",
   "executable_linux": "",
+  "auto_start": false,
   "auto_update": true,
   "auto_restart": true,
   "stop_time": "05:00",
@@ -398,6 +458,101 @@ Template schema (normalized):
 }
 ```
 
+Runtime option fields (also written into each instance's `server_settings.json`):
+
+- `auto_start`: start this server automatically when DGSM boots (default `false`).
+- `auto_update`: run an update before every start (Steam apps only).
+- `auto_restart`: restart automatically if the process crashes.
+- `stop_time`: daily stop time `HH:MM` (empty disables the scheduled stop).
+- `restart_after_stop`: restart again after the scheduled daily stop.
+
+Older templates/instances without `auto_start` keep working — the field defaults to `false` and is added automatically the next time the file is written.
+
+#### Non-Steam templates (Minecraft)
+
+`app_id` doubles as the install provider. A purely numeric `app_id` uses SteamCMD;
+a letter-based `app_id` selects a built-in non-Steam installer instead:
+
+| `app_id` | Installs |
+| --- | --- |
+| `minecraft_vanilla` | Official Minecraft Java server + matching Temurin JRE |
+| `minecraft_fabric` | Fabric server launcher + server jar + matching Temurin JRE |
+| `minecraft_bedrock` | Official Bedrock dedicated server (no Java needed) |
+| `custom_url` | Generic: download any server from a direct URL (zip/tar.gz/.exe/.jar) |
+
+For anything with custom install logic, a template can also ship an `install.py`
+(see *Custom plugins* below) — that is how the bundled **Hytale** template works.
+
+The Minecraft templates set `auto_update: false` and bundle their own Java runtime into
+`serverfiles/jre`, so nothing has to be installed on the host. The required Java
+version is read from Mojang's version manifest, so new Minecraft releases get a
+matching JRE automatically. Add one with `/addserver template:MinecraftFabric` (or `MinecraftVanilla` / `MinecraftBedrock`).
+
+##### Generic download installer (`custom_url`)
+
+For any non-Steam server that is published as a direct download (for example a
+future **Hytale** server build, or any game that ships a `.exe`/`.jar`/archive),
+use the `custom_url` provider. The download details live in a `dgsm_install.json`
+inside the template folder; `/addserver` copies it verbatim into the instance.
+
+```json
+{
+  "download_url": "https://example.com/server-win.zip",
+  "archive": "auto",
+  "strip_top_level": false,
+  "filename": "",
+  "java": false,
+  "java_major": "",
+  "eula": false
+}
+```
+
+- `archive`: `auto` (detect by URL extension) / `zip` / `targz` / `none` (single file).
+- `strip_top_level`: drop a single wrapping folder inside the archive.
+- `filename`: target name for a single-file download (defaults to the URL's name).
+- `java` / `java_major`: provision a Temurin JRE into `serverfiles/jre` (for `.jar` servers).
+- `eula`: also write a Minecraft-style `eula.txt`.
+
+##### Custom plugins (`install.py`)
+
+For non-Steam servers with their own install logic, a template can include an
+`install.py` next to its `config.json`. If present, DGSM runs its
+`install(serverfiles, ctx)` on install/update instead of the built-in providers —
+a universal, self-contained plugin model (similar to WindowsGSM, but a short
+Python function instead of a C# class, and no core changes required).
+
+`ctx` provides stable helpers: `log`, `is_windows()`, `download(url, dest)`,
+`http_get_bytes/json(url)`, `extract_zip_file/bytes(...)`, `ensure_jre(dir, major)`,
+`write_eula(dir)`, and `run_logged(cmd, cwd, timeout, prefix) -> (rc, lines)`
+(streams a tool's output to the log — handy for device-login flows).
+
+```python
+# plugin_templates/MyGame/install.py
+def install(serverfiles, ctx):
+    ctx.download("https://example.com/server.zip", serverfiles + "/server.zip")
+    ctx.extract_zip_file(serverfiles + "/server.zip", serverfiles)
+    return "MyGame installed"
+```
+
+A fully commented starter template lives in `plugin_templates/ExampleCustomGame/`
+(copy it, adjust `install.py` + `config.json`, remove the placeholder guard).
+
+##### Hytale (bundled `install.py` plugin)
+
+The bundled `Hytale` template is an `install.py` plugin (logic ported from
+[WindowsGSM.Hytale](https://github.com/Raziel7893/WindowsGSM.Hytale)). On
+`/addserver template:Hytale` or **Update**, DGSM provisions Java 25, fetches the
+official downloader and runs it, **streaming the device-login URL to the log**.
+
+1. `/addserver template:Hytale` → DGSM sets up Java + downloader and starts it.
+2. Open the printed login URL (also in `HYTALE_SETUP.txt`), log in with your
+   Hytale account. The downloader then fetches `Hytale.zip` and caches credentials.
+3. Press **Update** → DGSM extracts `Server/` + `Assets.zip`. Future updates run
+   headless (no login).
+
+Start command: `java -jar Server/HytaleServer.jar --assets Assets.zip --bind <IP>:5520`
+(port **5520/UDP**). Adjust the jar name in the template if the official build differs.
+
 ### 3. `server_settings.json` per server instance
 
 Typical locations:
@@ -405,10 +560,15 @@ Typical locations:
 - Legacy layout: `src/steam/GSM/servers/<app_id>/serverfiles/server_settings.json`
 - Instance layout: `src/steam/GSM/servers/<app_id>/instances/<instance_id>/serverfiles/server_settings.json`
 
+It holds the same runtime option fields as the template (`auto_start`, `auto_update`,
+`auto_restart`, `stop_time`, `restart_after_stop`) plus `executable` and `parameters`.
+These are editable from Discord (`/cli`, settings), the desktop UI and the web UI.
+
 Notes:
 
 - Keep backups before manual edits.
 - JSON must be valid.
+- `auto_start` takes effect on the next DGSM start; check the log for `[AUTO-START]` lines.
 
 ---
 

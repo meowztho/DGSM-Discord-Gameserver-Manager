@@ -205,3 +205,21 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Obsidian local state
+.obsidian/workspace.json
+.obsidian/workspaces.json
+.obsidian/hotkeys.json
+.obsidian/community-plugins.json
+
+# --- DGSM runtime data & secrets (do NOT commit) ---
+# SteamCMD binary + downloaded server files (large) and Steam login sessions
+/src/steam/
+/src/steam_sessions/
+# Runtime config that fills with (encrypted) credentials at runtime
+/src/server_config.json
+# SQLite action log + runtime PID cache
+*.db
+/src/server_pids.json
+# Generated security scan report
+bandit_report.json

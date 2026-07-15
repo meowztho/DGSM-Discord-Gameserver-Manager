@@ -20,5 +20,116 @@
     "auto_update": true,
     "auto_restart": true,
     "stop_time": "05:02",
-    "restart_after_stop": false
+    "restart_after_stop": false,
+    "rest_api": {
+        "enabled": false,
+        "base_url": "http://127.0.0.1:8212",
+        "auth": {
+            "type": "basic",
+            "username": "admin",
+            "password_from_parameter": "AdminPassword"
+        },
+        "timeout_seconds": 2,
+        "cache_seconds": 120,
+        "error_cache_seconds": 300,
+        "poll_when_stopped": false,
+        "poll": [
+            "info",
+            "metrics"
+        ],
+        "endpoints": {
+            "info": {
+                "method": "GET",
+                "path": "/v1/api/info"
+            },
+            "metrics": {
+                "method": "GET",
+                "path": "/v1/api/metrics"
+            },
+            "players": {
+                "method": "GET",
+                "path": "/v1/api/players"
+            },
+            "settings": {
+                "method": "GET",
+                "path": "/v1/api/settings"
+            }
+        },
+        "display": {
+            "ui_card": [
+                "metrics.currentplayernum",
+                "metrics.maxplayernum",
+                "metrics.serverfps",
+                "metrics.uptime",
+                "info.version"
+            ]
+        },
+        "actions": {
+            "enabled": false,
+            "commands": {
+                "announce": {
+                    "method": "POST",
+                    "path": "/v1/api/announce",
+                    "arguments": [
+                        {
+                            "name": "message",
+                            "required": true,
+                            "consume_rest": true,
+                            "max_length": 500
+                        }
+                    ]
+                },
+                "save": {
+                    "method": "POST",
+                    "path": "/v1/api/save",
+                    "arguments": []
+                },
+                "kick": {
+                    "method": "POST",
+                    "path": "/v1/api/kick",
+                    "arguments": [
+                        {
+                            "name": "userid",
+                            "required": true,
+                            "max_length": 128
+                        },
+                        {
+                            "name": "message",
+                            "required": false,
+                            "consume_rest": true,
+                            "max_length": 500
+                        }
+                    ]
+                },
+                "ban": {
+                    "method": "POST",
+                    "path": "/v1/api/ban",
+                    "arguments": [
+                        {
+                            "name": "userid",
+                            "required": true,
+                            "max_length": 128
+                        },
+                        {
+                            "name": "message",
+                            "required": false,
+                            "consume_rest": true,
+                            "max_length": 500
+                        }
+                    ]
+                },
+                "unban": {
+                    "method": "POST",
+                    "path": "/v1/api/unban",
+                    "arguments": [
+                        {
+                            "name": "userid",
+                            "required": true,
+                            "max_length": 128
+                        }
+                    ]
+                }
+            }
+        }
+    }
 }

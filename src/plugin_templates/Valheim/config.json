@@ -1,6 +1,9 @@
 {
     "app_id": "896660",
     "executable": "valheim_server.exe",
+    "executable_windows": "",
+    "executable_linux": "",
+    "auto_start": false,
     "auto_update": true,
     "auto_restart": true,
     "stop_time": "05:00",
