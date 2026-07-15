@@ -3,5 +3,7 @@ python-dotenv
 cryptography
 psutil
 pydantic
+certifi
 pre-commit
 PySide6
+fritzconnection

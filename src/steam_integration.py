@@ -14,9 +14,11 @@ from urllib.parse import urlparse
 from config_store import BASE_DIR, STEAM_SESSIONS_DIR
 from config_store import load_config
 from config_store import get_config_value
+from custom_install import is_steam_app_id, run_custom_install
 import paths  # wichtig: Modul importieren, nicht einzelne Variablen
 from platform_utils import is_windows, is_linux, normalize_user_path, executable_path_variants
 from runtime_status import begin_operation, end_operation_success, end_operation_failed
+from template_utils import normalize_steam_update_args
 
 # ----------------------------
 # Konfiguration
@@ -351,6 +353,7 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
 
             load_config()
             paths.load_server_paths()
+            paths.load_server_configs()
             app_id = get_config_value(server_name, "app_id")
             if not app_id:
                 fail_reason = "Keine App-ID konfiguriert"
@@ -360,6 +363,16 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
                 BASE_DIR, "steam", "GSM", "servers", str(app_id), "serverfiles"
             )
             os.makedirs(install_dir, exist_ok=True)
+
+            # Nicht-numerische App-ID => Nicht-Steam-Spiel (z. B. Minecraft).
+            # Kein SteamCMD, sondern dedizierter Installer. Gleicher Update-Pfad,
+            # damit der Update-Button identisch funktioniert.
+            if not is_steam_app_id(app_id):
+                ok, msg = await run_custom_install(server_name, str(app_id), install_dir)
+                success = ok
+                if not ok:
+                    fail_reason = msg
+                return ok, msg
 
             user = get_config_value(server_name, "username")
             pw = get_config_value(server_name, "password")
@@ -380,7 +393,12 @@ async def run_update(server_name: str) -> Tuple[bool, str]:
                 cmd.extend(["+login", user, pw])
             else:
                 cmd.extend(["+login", "anonymous"])
-            cmd.extend(["+app_update", str(app_id), "validate", "+quit"])
+            steam_update_args = normalize_steam_update_args(
+                paths.SERVER_CONFIGS.get(server_name, {}).get("steam_update_args")
+            )
+            cmd.extend(["+app_update", str(app_id)])
+            cmd.extend(steam_update_args)
+            cmd.extend(["validate", "+quit"])
 
             start_time = time_lib.time()
             process = await asyncio.create_subprocess_exec(
