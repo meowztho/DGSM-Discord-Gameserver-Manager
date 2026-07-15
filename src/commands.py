@@ -52,6 +52,7 @@ from runtime_status import (
     get_operation_status,
 )
 from cli_commands import execute_cli_command
+from wgsm_import import format_import_summary, import_wgsm_plugin
 
 
 # ---------- helper: robust defer & reply ----------
@@ -508,6 +509,7 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
         "auto_restart",
         "stop_time",
         "restart_after_stop",
+        "rest_api",
     ]
     try:
         if section == "config":
@@ -521,7 +523,7 @@ async def key_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoic
                 sf = os.path.join(SERVER_PATHS[name], "server_settings.json")
                 if os.path.exists(sf):
                     try:
-                        with open(sf, "r", encoding="utf-8") as f:
+                        with open(sf, "r", encoding="utf-8-sig") as f:
                             existing = json.load(f)
                         keys = list(set(keys + list(existing.keys())))
                     except Exception:
@@ -624,6 +626,36 @@ async def create_template(
         await safe_send(ctx, f"✅ Template '{template_name}' erstellt/aktualisiert.", ephemeral=True)
     except Exception as e:
         await safe_send(ctx, f"❌ Fehler: {e}", ephemeral=True)
+
+
+@bot.slash_command(name="importwgsm", description="Importiert ein WindowsGSM-Plugin als DGSM-Template")
+@commands.has_role("Admin")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def import_windowsgsm_plugin(
+    ctx: discord.ApplicationContext,
+    source_url: Option(str, "HTTPS GitHub repository, .cs or plugin ZIP URL"),
+    template_name: Option(str, "Optionaler DGSM-Template-Name", required=False, default=""),
+):
+    await safe_defer(ctx, ephemeral=True)
+    try:
+        report = await asyncio.to_thread(
+            import_wgsm_plugin,
+            source_url,
+            PLUGIN_TEMPLATES_DIR,
+            template_name=template_name or "",
+            allow_local=False,
+        )
+        summary = format_import_summary(report)
+        warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
+        warning_text = ""
+        if warnings:
+            warning_text = "\n" + "\n".join(f"- {str(item)[:180]}" for item in warnings[:4])
+        write_action_log("importwgsm", str(report.get("template_name", "-")), "success", summary)
+        await safe_send(ctx, f"✅ WindowsGSM-Import abgeschlossen:\n`{summary}`{warning_text}", ephemeral=True)
+    except Exception as exc:
+        logging.exception("WindowsGSM plugin import failed")
+        write_action_log("importwgsm", template_name or "-", "failed", str(exc))
+        await safe_send(ctx, f"❌ WindowsGSM-Import fehlgeschlagen: {exc}", ephemeral=True)
 
 
 @bot.slash_command(name="addserver", description="Installiert einen neuen Server aus einem Template")
@@ -788,7 +820,7 @@ async def update_server(
         load_server_configs()
     else:
         sf = os.path.join(SERVER_PATHS[server], "server_settings.json")
-        s_cfg = json.load(open(sf, "r", encoding="utf-8")) if os.path.exists(sf) else {}
+        s_cfg = json.load(open(sf, "r", encoding="utf-8-sig")) if os.path.exists(sf) else {}
         s_cfg[key] = new_val
         json.dump(s_cfg, open(sf, "w", encoding="utf-8"), indent=4)
         load_server_configs()

@@ -55,6 +55,7 @@ DGSM ist ein Discord-gesteuerter Game-Server-Manager mit optionaler Desktop-UI, 
 ## Bestehende Projektdoku
 
 - [README.md](README.md)
+- [RELEASE_NOTES_v2.0.4.md](RELEASE_NOTES_v2.0.4.md)
 - [RELEASE_NOTES_v2.0.3.md](RELEASE_NOTES_v2.0.3.md)
 - [RELEASE_NOTES_v2.0.2.md](RELEASE_NOTES_v2.0.2.md)
 - [RELEASE_NOTES_v2.0.1.md](RELEASE_NOTES_v2.0.1.md)

@@ -73,24 +73,32 @@ def _state_payload() -> dict:
     }
 
 
+def _write_response(
+    handler: BaseHTTPRequestHandler,
+    body: bytes,
+    status: int,
+    content_type: str,
+    cache_control: str = "no-store",
+) -> None:
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Cache-Control", cache_control)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        logging.debug("[WEB-UI] Client disconnected while response was being written")
+
+
 def _json_response(handler: BaseHTTPRequestHandler, payload: object, status: int = 200) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+    _write_response(handler, body, status, "application/json; charset=utf-8")
 
 
 def _text_response(handler: BaseHTTPRequestHandler, body: str, status: int = 200, content_type: str = "text/html") -> None:
     encoded = body.encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", f"{content_type}; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Content-Length", str(len(encoded)))
-    handler.end_headers()
-    handler.wfile.write(encoded)
+    _write_response(handler, encoded, status, f"{content_type}; charset=utf-8")
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -154,6 +162,14 @@ async def _handle_template(data: dict) -> tuple[bool, str]:
     )
 
 
+async def _handle_wgsm_import(data: dict) -> tuple[bool, str]:
+    return await dui._import_wgsm_plugin_action(
+        source=str(data.get("source_url", "") or "").strip(),
+        template_name=str(data.get("template_name", "") or "").strip(),
+        allow_local=False,
+    )
+
+
 async def _handle_add_server(data: dict) -> tuple[bool, str]:
     return await dui._add_server_action(
         name=str(data.get("name", "") or "").strip(),
@@ -193,12 +209,7 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 if logo and os.path.isfile(logo):
                     with open(logo, "rb") as handle:
                         body = handle.read()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.send_header("Cache-Control", "public, max-age=3600")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    _write_response(self, body, 200, "image/png", "public, max-age=3600")
                     return
                 self.send_error(404)
                 return
@@ -223,6 +234,8 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 ok, message = _run_async(dui._run_cli_user_command(command), timeout=360.0)
             elif path == "/api/template":
                 ok, message = _run_async(_handle_template(data), timeout=360.0)
+            elif path == "/api/wgsm-import":
+                ok, message = _run_async(_handle_wgsm_import(data), timeout=180.0)
             elif path == "/api/server":
                 ok, message = _run_async(_handle_add_server(data), timeout=600.0)
             else:
@@ -325,6 +338,13 @@ _INDEX_HTML = r"""<!doctype html>
           <h2>Tools / Commands</h2>
           <form id="cliForm" class="form"><label>CLI command<input name="command"></label><button type="submit">Run CLI</button></form>
           <hr>
+          <form id="wgsmImportForm" class="form">
+            <h2>Import WindowsGSM Plugin</h2>
+            <label>HTTPS GitHub, .cs or ZIP URL<input name="source_url" type="url" required></label>
+            <label>Template name (optional)<input name="template_name"></label>
+            <button type="submit">Import Plugin</button>
+          </form>
+          <hr>
           <form id="templateForm" class="form">
             <h2>Create Template</h2>
             <label>Template name<input name="template_name"></label><label>Steam App ID<input name="app_id"></label><label>Executable<input name="executable"></label><label>Parameters<input name="parameters"></label><label>Daily stop (HH:MM)<input name="stop_time" value="05:00"></label>
@@ -351,9 +371,11 @@ _INDEX_HTML = r"""<!doctype html>
     async function api(path,data){busy=true;render();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const j=await r.json();toast(j.ok,j.message||'Done');await load();return j}finally{busy=false;render()}}
     async function load(){const r=await fetch('/api/state',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.message||'State failed');state=j.data;if(!selected&&state.servers[0])selected=state.servers[0].name;if(selected&&!state.servers.some(s=>s.name===selected))selected=state.servers[0]?.name||null;render()}
     function selectedRow(){return state.servers.find(s=>s.name===selected)}
+    function restText(s){const r=s&&s.rest;if(!r||!r.configured||!r.enabled)return '';if(Array.isArray(r.summary)&&r.summary.length)return 'REST API: '+r.summary.slice(0,6).map(esc).join(' | ');if(r.errors&&Object.keys(r.errors).length){const k=Object.keys(r.errors).sort()[0];return `REST API: ${esc(k)}: ${esc(r.errors[k])}`}return 'REST API: no data'}
+    function resourceText(s){const r=s&&s.resources;if(!s?.running||!r||!Object.keys(r).length)return '';const human=n=>{n=Number(n||0);for(const u of ['B','KB','MB','GB','TB']){if(Math.abs(n)<1024||u==='TB')return `${n<10&&u!=='B'?n.toFixed(1):Math.round(n)}${u}`;n/=1024}};return `Resources: ${Number(r.cpu||0).toFixed(1)}% CPU | ${human(r.rss)} RAM | I/O R ${human(r.read_bps)}/s W ${human(r.write_bps)}/s`}
     function render(){const running=state.servers.filter(s=>s.state==='running').length,stopped=state.servers.filter(s=>s.state==='stopped').length,updating=state.servers.filter(s=>s.state==='updating').length;$('#summary').textContent=`Running ${running} | Stopped ${stopped} | Updating ${updating}`;const row=selectedRow();$('#selectedLine').textContent=row?`Selected: ${row.name} | ${row.status} | ${row.detail}`:'Selected: -';
-      $('#metrics').innerHTML=['cpu','ram','disk','network','servers','uptime'].map(k=>`<div class="metric"><b>${k.toUpperCase()}</b><span>${esc(state.metrics[k]||'--')}</span></div>`).join('');
-      $('#servers').innerHTML=state.servers.map(s=>{const run=!!s.running,b=s.state==='updating';return `<article class="card ${s.name===selected?'selected':''}" data-name="${esc(s.name)}"><div><span class="name">${esc(s.name)}</span><span class="badge ${esc(s.state)}">${esc(s.status)}</span><div class="detail">${esc(s.detail)}</div><div class="feedback">${esc(s.feedback||'')}</div></div><div class="card-actions"><button class="primary" data-action="start" ${b||run||busy?'disabled':''}>Start</button><button class="danger" data-action="stop" ${b||!run||busy?'disabled':''}>Stop</button><button data-action="restart" ${b||busy?'disabled':''}>Restart</button><button data-action="update" ${b||run||busy?'disabled':''}>Update</button><button class="ghost" data-action="backup" ${b||busy?'disabled':''}>Backup</button><button data-action="restore" ${b||run||busy?'disabled':''}>Restore</button><button class="danger" data-action="remove" ${b||busy?'disabled':''}>Delete</button></div></article>`}).join('');
+      const metricLabels={dgsm:'DGSM',game_servers:'GAME SERVERS',server_io:'SERVER I/O',players:'PLAYERS',servers:'RUNNING',uptime:'DGSM UPTIME'};$('#metrics').innerHTML=Object.keys(metricLabels).map(k=>`<div class="metric"><b>${metricLabels[k]}</b><span>${esc(state.metrics[k]||'--')}</span></div>`).join('');
+      $('#servers').innerHTML=state.servers.map(s=>{const run=!!s.running,b=s.state==='updating',rt=s.name===selected?restText(s):'',res=resourceText(s);return `<article class="card ${s.name===selected?'selected':''}" data-name="${esc(s.name)}"><div><span class="name">${esc(s.name)}</span><span class="badge ${esc(s.state)}">${esc(s.status)}</span><div class="detail">${esc(s.detail)}</div><div class="feedback">${esc(s.feedback||'')}</div>${res?`<div class="detail">${esc(res)}</div>`:''}${rt?`<div class="detail">${rt}</div>`:''}</div><div class="card-actions"><button class="primary" data-action="start" ${b||run||busy?'disabled':''}>Start</button><button class="danger" data-action="stop" ${b||!run||busy?'disabled':''}>Stop</button><button data-action="restart" ${b||busy?'disabled':''}>Restart</button><button data-action="update" ${b||run||busy?'disabled':''}>Update</button><button class="ghost" data-action="backup" ${b||busy?'disabled':''}>Backup</button><button data-action="restore" ${b||run||busy?'disabled':''}>Restore</button><button class="danger" data-action="remove" ${b||busy?'disabled':''}>Delete</button></div></article>`}).join('');
       const form=$('#settingsForm');$('#settingsName').textContent=row?`Selected: ${row.name}`:'Selected: -';if(row&&!form.dataset.dirty){for(const [k,v] of Object.entries(row.settings||{})){const el=form.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=v||''}}
       {const L=$('#logs');const atB=L.scrollHeight-L.scrollTop-L.clientHeight<40;L.textContent=(state.logs||[]).join('\n');if(atB)L.scrollTop=L.scrollHeight;}$('#history').textContent=(state.history||[]).map(h=>`${h.timestamp} | ${h.action}/${h.server} | ${h.status} | ${h.details||'-'}`).join('\n');
       const select=$('#serverForm select[name=template_name]');const current=select.value;select.innerHTML=(state.templates||[]).map(t=>`<option>${esc(t)}</option>`).join('');if(current)select.value=current;
@@ -362,6 +384,7 @@ _INDEX_HTML = r"""<!doctype html>
     $('#settingsForm').addEventListener('input',e=>e.currentTarget.dataset.dirty='1');
     $('#settingsForm').addEventListener('submit',e=>{e.preventDefault();if(!selected)return toast(false,'Select a server first');const f=e.currentTarget,d=Object.fromEntries(new FormData(f).entries());for(const n of ['auto_start','auto_update','auto_restart','restart_after_stop'])d[n]=!!f.elements[n].checked;d.name=selected;delete f.dataset.dirty;api('/api/settings',d)});
     $('#cliForm').addEventListener('submit',e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.currentTarget).entries());api('/api/cli',d)});
+    $('#wgsmImportForm').addEventListener('submit',e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.currentTarget).entries());api('/api/wgsm-import',d)});
     $('#templateForm').addEventListener('submit',e=>{e.preventDefault();const f=e.currentTarget,d=Object.fromEntries(new FormData(f).entries());for(const n of ['auto_start','auto_update','auto_restart','restart_after_stop'])d[n]=!!f.elements[n].checked;api('/api/template',d)});
     $('#serverForm').addEventListener('submit',e=>{e.preventDefault();const f=e.currentTarget,d=Object.fromEntries(new FormData(f).entries());d.start_after_install=!!f.elements.start_after_install.checked;api('/api/server',d)});
     async function pollLogs(){try{const r=await fetch('/api/state',{cache:'no-store'});const j=await r.json();if(j&&j.ok&&j.data){state.logs=j.data.logs||[];state.history=j.data.history||[];const L=$('#logs');const atB=L.scrollHeight-L.scrollTop-L.clientHeight<40;L.textContent=state.logs.join('\n');if(atB)L.scrollTop=L.scrollHeight;$('#history').textContent=state.history.map(h=>`${h.timestamp} | ${h.action}/${h.server} | ${h.status} | ${h.details||'-'}`).join('\n');}}catch(e){}}
