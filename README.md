@@ -65,16 +65,6 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 
 ---
 
-## Obsidian Vault
-
-You can open the repository root directly in Obsidian as a vault.
-
-- Start with `00-Obsidian-Start.md`
-- Project notes live in `obsidian/`
-- The shared vault setup is stored in `.obsidian/`
-
----
-
 ## 📦 Installation
 
 1. **Install Python 3.12**\
@@ -129,6 +119,8 @@ From `v2.0.1`, releases can include both:
 
 - full source code (as before)
 - prebuilt Windows package in `dist/DGSM/`
+
+Version-specific changelogs are stored in [`docs/releases/`](docs/releases/).
 
 Start prebuilt version with:
 
