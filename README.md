@@ -19,6 +19,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
   - [Discord Bot Setup](#️-discord-bot-setup)
   - [Optional CLI Commands](#️-optional-cli-commands)
   - [Local Desktop UI (Addon)](#️-local-desktop-ui-addon)
+  - [Resource Metrics & REST API Bridge](#-resource-metrics--rest-api-bridge)
   - [Build Windows EXE](#️-build-windows-exe)
   - [Screenshots](#-screenshots)
   - [SteamCMD Setup](#-steamcmd-setup)
@@ -47,6 +48,9 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Create ZIP backups via `/createbackup`
 - Restore server data from ZIP backups via `/restorebackup`
 - Live operation states in UI (start/stop/update/backup/restore)
+- Process-based DGSM and game-server CPU, RAM and disk-I/O metrics
+- Optional active-player totals and server details from enabled game REST APIs
+- Config-driven REST command allowlists shared by Discord, Desktop UI and Web UI
 - Optional auto-start on boot, auto-update and scheduled restart
 - Non-Steam installs via templates: Minecraft **Vanilla**, **Fabric** and **Bedrock** (bundled Java, no host setup)
 - Manage multiple servers (Palworld, Core Keeper, Satisfactory, Unturned…)
@@ -302,6 +306,52 @@ DGSM_HIDE_CONSOLE_WHEN_UI=true
 ```
 
 Note: `DGSM_HIDE_CONSOLE_WHEN_UI` applies to Windows console behavior.
+
+---
+
+## 📊 Resource Metrics & REST API Bridge
+
+The Desktop UI and Web UI show resources caused by DGSM and its managed game
+servers instead of general host utilization:
+
+- **DGSM**: CPU usage and resident memory of the bot process
+- **Game Servers**: combined CPU usage and resident memory of managed server processes
+- **Server I/O**: combined process disk read/write throughput
+- **Players**: active/max players reported by enabled and currently available REST APIs
+- **Running**: running server instances compared with configured instances
+- **DGSM Uptime**: runtime of the current DGSM process
+
+Running server cards additionally show their own CPU, RAM and disk-I/O values.
+One bounded process scan is shared and briefly cached, so opening Desktop and Web
+views does not continuously rescan processes. REST polling also uses caching and
+error backoff to avoid overloading game APIs.
+
+REST integration is optional per server. A missing configuration, or
+`rest_api.enabled: false`, leaves normal installation, startup, monitoring and
+Discord operation unchanged. When enabled, clicking a server card can reveal
+configured API values such as players, FPS, uptime or version.
+
+REST commands require the additional `rest_api.actions.enabled: true` switch and
+an explicit command allowlist. They can then be called through the same dispatcher
+from Discord `/cli`, the Desktop Live Log, or the Web UI:
+
+```text
+api Palworld-main list
+api Palworld-main announce "Restart in 10 minutes"
+api Palworld-main save
+```
+
+DGSM does not provide arbitrary HTTP or shell execution. API commands are limited
+to configured relative POST paths, bounded typed arguments and the server's
+existing authentication. Lifecycle operations such as start, stop, restart,
+update, install and delete remain DGSM commands and continue through the existing
+Discord-aware server manager, PID tracking and logging paths.
+
+Templates may contain disabled example REST values. They are inert until both the
+server API and, separately, its action allowlist are enabled. Keep game REST APIs
+on localhost or a trusted LAN. See
+[`docs/REST_API_BRIDGE.md`](docs/REST_API_BRIDGE.md) for the configuration schema,
+Palworld examples and safety rules.
 
 ---
 
