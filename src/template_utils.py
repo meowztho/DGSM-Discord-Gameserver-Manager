@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 from typing import Any, Dict, List
 
 from platform_utils import is_windows, is_linux
@@ -42,6 +43,32 @@ def _as_parameters(value: Any) -> List[str]:
     return [part for part in txt.split() if part]
 
 
+def normalize_steam_update_args(value: Any) -> List[str]:
+    if isinstance(value, list):
+        raw = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        text = _as_str(value)
+        try:
+            raw = shlex.split(text, posix=True) if text else []
+        except ValueError:
+            raw = []
+
+    out: List[str] = []
+    index = 0
+    while index < len(raw):
+        flag = raw[index].lower()
+        if flag not in {"-beta", "-betapassword"} or index + 1 >= len(raw):
+            index += 1
+            continue
+        value_text = raw[index + 1]
+        if value_text.startswith(("+", "-")) or not value_text:
+            index += 1
+            continue
+        out.extend((flag, value_text))
+        index += 2
+    return out
+
+
 def current_os_executable_key() -> str:
     if is_windows():
         return "executable_windows"
@@ -63,7 +90,7 @@ def normalize_server_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
     if stop_time and not _STOP_TIME_RE.match(stop_time):
         stop_time = "05:00"
 
-    return {
+    out = {
         "executable": executable,
         "executable_windows": executable_windows,
         "executable_linux": executable_linux,
@@ -74,6 +101,13 @@ def normalize_server_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         "stop_time": stop_time,
         "restart_after_stop": _as_bool(src.get("restart_after_stop"), False),
     }
+    rest_api = src.get("rest_api")
+    if isinstance(rest_api, dict):
+        out["rest_api"] = rest_api
+    steam_update_args = normalize_steam_update_args(src.get("steam_update_args"))
+    if steam_update_args:
+        out["steam_update_args"] = steam_update_args
+    return out
 
 
 def with_detected_executable(settings: Dict[str, Any], executable: str) -> Dict[str, Any]:
@@ -106,6 +140,10 @@ def normalize_template_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "restart_after_stop": settings["restart_after_stop"],
         "parameters": settings["parameters"],
     }
+    if isinstance(settings.get("rest_api"), dict):
+        out["rest_api"] = settings["rest_api"]
+    if isinstance(settings.get("steam_update_args"), list):
+        out["steam_update_args"] = settings["steam_update_args"]
 
     username = _as_str(src.get("username"))
     password = _as_str(src.get("password"))
@@ -140,6 +178,7 @@ def build_template_config(
     username: str = "",
     password: str = "",
     auto_start: bool = False,
+    steam_update_args: Any = None,
 ) -> Dict[str, Any]:
     raw: Dict[str, Any] = {
         "app_id": _as_str(app_id),
@@ -151,6 +190,9 @@ def build_template_config(
         "stop_time": _as_str(stop_time) or "05:00",
         "restart_after_stop": bool(restart_after_stop),
     }
+    normalized_update_args = normalize_steam_update_args(steam_update_args)
+    if normalized_update_args:
+        raw["steam_update_args"] = normalized_update_args
     if _as_str(username) and _as_str(password):
         raw["username"] = _as_str(username)
         raw["password"] = _as_str(password)

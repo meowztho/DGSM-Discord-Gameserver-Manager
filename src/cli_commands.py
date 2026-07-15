@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from db import write_action_log
-from paths import SERVER_PATHS, load_server_configs, load_server_paths
+from paths import SERVER_CONFIGS, SERVER_PATHS, load_server_configs, load_server_paths
+from rest_bridge import describe_rest_actions, execute_rest_action
 from runtime_status import get_operation_status
 from server_manager import server_processes, start_server, stop_server
 from steam_integration import run_update
@@ -21,6 +22,8 @@ HELP_TEXT = (
     "  stop <server>\n"
     "  restart <server>\n"
     "  update <server>\n"
+    "  api <server> list\n"
+    "  api <server> <command> [arguments]\n"
     "  refresh\n\n"
     "Hinweis: Discord bleibt die Hauptsteuerung, CLI ist optional."
 )
@@ -44,14 +47,22 @@ def _split_line(command_line: str) -> List[str]:
     raw = str(command_line or "").strip()
     if not raw:
         return []
+    def _normalize(tokens: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for token in tokens:
+            value = str(token)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            normalized.append(value)
+        return normalized
     try:
         # Windows and Linux use slightly different quote parsing; this keeps both workable.
-        return shlex.split(raw, posix=(os.name != "nt"))
+        return _normalize(shlex.split(raw, posix=(os.name != "nt")))
     except ValueError:
         try:
-            return shlex.split(raw, posix=False)
+            return _normalize(shlex.split(raw, posix=False))
         except ValueError:
-            return [raw]
+            return []
 
 
 def _load_names() -> List[str]:
@@ -164,6 +175,42 @@ async def execute_cli_command(command_line: str, source: str = "cli") -> CliExec
     if cmd == "refresh":
         result = CliExecutionResult(True, "Refresh queued", refresh=True)
         _log(source, command_line, result)
+        return result
+
+    if cmd == "api":
+        if len(args) < 2:
+            result = CliExecutionResult(False, "Usage: api <server> list | api <server> <command> [arguments]")
+            _log(source, command_line, result)
+            return result
+
+        resolved, err = _resolve_server(args[0])
+        server = str(args[0])
+        if err:
+            result = CliExecutionResult(False, err)
+            _log(source, command_line, result, server=server)
+            return result
+        server = str(resolved)
+        server_cfg = SERVER_CONFIGS.get(server, {})
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+
+        api_command = str(args[1]).lower()
+        if api_command in {"list", "help", "?"}:
+            available = describe_rest_actions(server_cfg)
+            message = f"{server}: allowed API commands:\n" + ("\n".join(f"  {item}" for item in available) if available else "  none")
+            result = CliExecutionResult(bool(available), message)
+            _log(source, command_line, result, server=server)
+            return result
+
+        ok, message = await execute_rest_action(
+            server,
+            server_cfg,
+            api_command,
+            [str(item) for item in args[2:]],
+            running=_is_running(server),
+        )
+        result = CliExecutionResult(ok, message, refresh=ok)
+        _log(source, command_line, result, server=server)
         return result
 
     if cmd in {"start", "stop", "restart", "update"}:

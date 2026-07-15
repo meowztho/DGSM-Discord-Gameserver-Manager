@@ -57,6 +57,7 @@ Designed as a lightweight alternative to WindowsGSM, DGSM runs entirely through 
 - Runs on Windows and Linux servers
 - Keeps existing templates usable with OS-specific executable fallback
 - Normalized template JSON schema across all `plugin_templates`
+- Static WindowsGSM plugin import for creating reviewed DGSM templates without executing foreign C# code
 
 ---
 
@@ -213,6 +214,8 @@ Supported commands:
 - `stop <server>`
 - `restart <server>`
 - `update <server>`
+- `api <server> list`
+- `api <server> <command> [arguments]`
 - `refresh`
 
 Examples:
@@ -221,6 +224,7 @@ Examples:
 /cli command:"list"
 /cli command:"status Palworld-main"
 /cli command:"restart Palworld-main"
+/cli command:"api Palworld-main save"
 ```
 
 In desktop UI Live Log CLI bar:
@@ -229,7 +233,14 @@ In desktop UI Live Log CLI bar:
 list
 status Palworld-main
 update Palworld-main
+api Palworld-main list
+api Palworld-main announce "Restart in 10 minutes"
 ```
+
+API commands are read from the selected server's `rest_api.actions.commands`
+allowlist. Discord `/cli`, Desktop UI and Web UI all use the same dispatcher.
+Lifecycle operations such as start, stop, restart and update always remain DGSM
+commands and cannot be redirected to a game REST API.
 
 ---
 
@@ -412,6 +423,23 @@ Behavior summary:
 - If a template comes without `executable`, it is accepted.
 - DGSM automatically detects a suitable start file on Windows/Linux and writes it back as a hint.
 - You can still set `executable_windows` / `executable_linux` explicitly for exact control.
+
+#### WindowsGSM plugin import
+
+DGSM can statically inspect a WindowsGSM `.cs` file, ZIP archive, GitHub repository,
+or local plugin folder and create a normalized template. Use **Import WindowsGSM Plugin**
+in the Desktop/Web tools or the admin-only Discord command `/importwgsm`.
+
+- SteamCMD plugins with an App ID and start path become normal DGSM templates.
+- C# code is never compiled or executed. DGSM keeps its own install/update/start/stop logic.
+- Custom installers become blocked review templates and require a reviewed native `install.py`.
+- `windowsgsm_import.json` records the source hash, extracted fields, compatibility, and warnings.
+- Discord and Web imports accept public HTTPS URLs only; local paths are Desktop UI only.
+
+See [`docs/WINDOWSGSM_IMPORT.md`](docs/WINDOWSGSM_IMPORT.md) for the compatibility rules and workflow.
+
+The optional REST bridge, resource metrics and API command allowlist are documented
+in [`docs/REST_API_BRIDGE.md`](docs/REST_API_BRIDGE.md).
 
 Template schema (normalized):
 

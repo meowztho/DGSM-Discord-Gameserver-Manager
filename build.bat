@@ -9,6 +9,7 @@ set "APP_MAIN=%SRC%\Main.py"
 set "ICON_ICO=%SRC%\Logo.ico"
 set "ICON_PNG=%SRC%\Logo.png"
 set "PY_CMD=python"
+set "PYI_EXTRA=--hidden-import pkg_resources.extern"
 
 echo [BUILD] Root: %ROOT%
 
@@ -53,9 +54,9 @@ if not exist "%ICON_ICO%" if exist "%ICON_PNG%" (
 
 echo [BUILD] Running PyInstaller...
 if exist "%ICON_ICO%" (
-  %PY_CMD% -m PyInstaller --noconfirm --clean --onedir --name "%APP_NAME%" --icon "%ICON_ICO%" --paths "%SRC%" --add-data "%ICON_PNG%;." "%APP_MAIN%"
+  %PY_CMD% -m PyInstaller --noconfirm --clean --onedir --name "%APP_NAME%" --icon "%ICON_ICO%" --paths "%SRC%" %PYI_EXTRA% --add-data "%ICON_PNG%;." "%APP_MAIN%"
 ) else (
-  %PY_CMD% -m PyInstaller --noconfirm --clean --onedir --name "%APP_NAME%" --paths "%SRC%" --add-data "%ICON_PNG%;." "%APP_MAIN%"
+  %PY_CMD% -m PyInstaller --noconfirm --clean --onedir --name "%APP_NAME%" --paths "%SRC%" %PYI_EXTRA% --add-data "%ICON_PNG%;." "%APP_MAIN%"
 )
 if errorlevel 1 (
   echo [ERROR] Build failed.

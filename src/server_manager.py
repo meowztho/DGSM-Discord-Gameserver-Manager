@@ -213,7 +213,7 @@ def ensure_server_executable_hint(server_name: str) -> Optional[str]:
         raw_settings = {}
         if os.path.isfile(settings_file):
             try:
-                with open(settings_file, "r", encoding="utf-8") as handle:
+                with open(settings_file, "r", encoding="utf-8-sig") as handle:
                     loaded = json.load(handle)
                 if isinstance(loaded, dict):
                     raw_settings = loaded
@@ -637,4 +637,3 @@ async def graceful_stop_all():
             await stop_server(name)
         except Exception:
             pass
-
