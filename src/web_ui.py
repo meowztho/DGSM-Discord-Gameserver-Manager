@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
-import desktop_ui as dui
+import dgsm_operations as dgsm_ops
+import dgsm_view as view
 
 
 _SERVER: Optional[ThreadingHTTPServer] = None
@@ -52,11 +53,11 @@ def _run_async(coro: Awaitable[object], timeout: float = 360.0) -> object:
 
 
 def _state_payload() -> dict:
-    rows = _run_async(dui._collect_servers(), timeout=15.0)
+    rows = _run_async(view.collect_servers(), timeout=15.0)
     servers = rows if isinstance(rows, list) else []
     return {
         "servers": servers,
-        "metrics": dui._collect_system_metrics(servers),
+        "metrics": view.collect_system_metrics(servers),
         "history": [
             {
                 "timestamp": str(item[0]),
@@ -65,11 +66,11 @@ def _state_payload() -> dict:
                 "status": str(item[3]),
                 "details": str(item[4] or ""),
             }
-            for item in dui._collect_history(80)
+            for item in view.collect_history(80)
         ],
-        "logs": list(dui._LIVE_LOG_LINES)[-260:],
-        "templates": dui._list_templates(),
-        "backups": dui._list_backup_files(),
+        "logs": list(view.LIVE_LOG_LINES)[-260:],
+        "templates": view.list_templates(),
+        "backups": view.list_backup_files(),
     }
 
 
@@ -119,22 +120,22 @@ async def _handle_action(data: dict) -> tuple[bool, str]:
     name = str(data.get("name", "") or "").strip()
     action = str(data.get("action", "") or "").strip().lower()
     if action in {"start", "stop", "restart", "update"}:
-        return await dui._run_action(name, action)
+        return await dgsm_ops.run_action(name, action)
     if action == "backup":
-        return await dui._create_backup_action(name)
+        return await dgsm_ops.create_backup(name)
     if action == "restore":
-        return await dui._restore_backup_action(
+        return await dgsm_ops.restore_backup(
             name,
             str(data.get("backup_file", "") or "").strip(),
             overwrite=bool(data.get("overwrite", False)),
         )
     if action == "remove":
-        return await dui._remove_server_action(name, backup_before_delete=bool(data.get("backup_first", True)))
+        return await dgsm_ops.remove_server(name, backup_before_delete=bool(data.get("backup_first", True)))
     return False, f"Unknown action: {action}"
 
 
 async def _handle_settings(data: dict) -> tuple[bool, str]:
-    return await dui._save_settings(
+    return await dgsm_ops.save_settings(
         name=str(data.get("name", "") or "").strip(),
         executable=str(data.get("executable", "") or "").strip(),
         parameters=str(data.get("parameters", "") or "").strip(),
@@ -147,7 +148,7 @@ async def _handle_settings(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_template(data: dict) -> tuple[bool, str]:
-    return await dui._create_template_action(
+    return await dgsm_ops.create_template(
         template_name=str(data.get("template_name", "") or "").strip(),
         app_id=str(data.get("app_id", "") or "").strip(),
         executable=str(data.get("executable", "") or "").strip(),
@@ -163,7 +164,7 @@ async def _handle_template(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_wgsm_import(data: dict) -> tuple[bool, str]:
-    return await dui._import_wgsm_plugin_action(
+    return await dgsm_ops.import_wgsm_plugin_action(
         source=str(data.get("source_url", "") or "").strip(),
         template_name=str(data.get("template_name", "") or "").strip(),
         allow_local=False,
@@ -171,7 +172,7 @@ async def _handle_wgsm_import(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_add_server(data: dict) -> tuple[bool, str]:
-    return await dui._add_server_action(
+    return await dgsm_ops.add_server(
         name=str(data.get("name", "") or "").strip(),
         template_name=str(data.get("template_name", "") or "").strip(),
         instance_id=str(data.get("instance_id", "") or "").strip(),
@@ -205,7 +206,7 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": _state_payload()})
                 return
             if path == "/logo.png":
-                logo = dui._find_logo_file()
+                logo = view.find_logo_file()
                 if logo and os.path.isfile(logo):
                     with open(logo, "rb") as handle:
                         body = handle.read()
@@ -230,8 +231,8 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 ok, message = _run_async(_handle_settings(data))
             elif path == "/api/cli":
                 command = str(data.get("command", "") or "").strip()
-                dui._LIVE_LOG_LINES.append(f"[WEB] > {html.escape(command)[:220]}")
-                ok, message = _run_async(dui._run_cli_user_command(command), timeout=360.0)
+                view.LIVE_LOG_LINES.append(f"[WEB] > {html.escape(command)[:220]}")
+                ok, message = _run_async(view.run_cli_user_command(command, source="desktop-ui"), timeout=360.0)
             elif path == "/api/template":
                 ok, message = _run_async(_handle_template(data), timeout=360.0)
             elif path == "/api/wgsm-import":
@@ -265,9 +266,9 @@ def start_web_ui(
 
     _LOOP = loop
     if refresh_callback is not None:
-        dui._REFRESH_CALLBACK = refresh_callback
-    dui._bootstrap_log_lines()
-    dui._install_live_log_handler()
+        view.configure_refresh_callback(refresh_callback)
+    view.bootstrap_log_lines()
+    view.install_live_log_handler()
 
     try:
         server = ThreadingHTTPServer((host, port), _WebUiHandler)

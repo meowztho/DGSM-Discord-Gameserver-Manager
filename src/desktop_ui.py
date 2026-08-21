@@ -1,4 +1,4 @@
-﻿
+
 from __future__ import annotations
 
 import asyncio
@@ -40,6 +40,8 @@ from template_utils import (
 )
 from rest_bridge import collect_rest_snapshot
 from wgsm_import import format_import_summary, import_wgsm_plugin
+import dgsm_operations as dgsm_ops
+import dgsm_view as view
 
 try:
     import psutil
@@ -88,7 +90,7 @@ _QT_WINDOW = None
 _QT_PUMP_TASK: Optional[asyncio.Task] = None
 
 _ACTION_FEEDBACK: Dict[str, Dict[str, str | int]] = {}
-_LIVE_LOG_LINES: deque[str] = deque(maxlen=1200)
+_LIVE_LOG_LINES = view.LIVE_LOG_LINES
 _STOP_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _APP_STARTED_TS = time.time()
 _PROC_NET_SAMPLE: Dict[int, Tuple[int, int]] = {}
@@ -536,64 +538,13 @@ def _api_player_metric(rows: Optional[List[Dict[str, object]]]) -> str:
 
 
 def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> Dict[str, str]:
-    global _METRICS_CACHE, _METRICS_CACHE_TS, _SERVER_RESOURCE_CACHE
-    running = sum(1 for row in rows or [] if str(row.get("state", "")) == "running")
-    total_servers = len(rows or [])
-    now = time.time()
-    with _METRICS_LOCK:
-        if _METRICS_CACHE and now - _METRICS_CACHE_TS < _METRICS_CACHE_SECONDS:
-            metrics = dict(_METRICS_CACHE)
-            metrics["players"] = _api_player_metric(rows)
-            metrics["servers"] = f"{running} / {total_servers}"
-        else:
-            server_resources = _collect_server_process_metrics(_running_server_roots_by_name(rows))
-            bot_resources = _collect_bot_process_metrics()
-            _SERVER_RESOURCE_CACHE = server_resources
-            server_cpu = sum(float(item.get("cpu", 0.0) or 0.0) for item in server_resources.values())
-            server_rss = sum(int(item.get("rss", 0) or 0) for item in server_resources.values())
-            server_read = sum(float(item.get("read_bps", 0.0) or 0.0) for item in server_resources.values())
-            server_write = sum(float(item.get("write_bps", 0.0) or 0.0) for item in server_resources.values())
-            metrics = {
-                "dgsm": f"{float(bot_resources['cpu']):.1f}% CPU | {_human_bytes(int(bot_resources['rss']))}",
-                "game_servers": f"{server_cpu:.1f}% CPU | {_human_bytes(server_rss)}",
-                "server_io": f"R {_human_bytes(server_read)}/s | W {_human_bytes(server_write)}/s",
-                "players": _api_player_metric(rows),
-                "servers": f"{running} / {total_servers}",
-                "uptime": _format_uptime(now - _APP_STARTED_TS),
-            }
-            _METRICS_CACHE = dict(metrics)
-            _METRICS_CACHE_TS = now
-
-        for row in rows or []:
-            name = str(row.get("name", "") or "")
-            row["resources"] = dict(_SERVER_RESOURCE_CACHE.get(name, {}))
-        return metrics
-
+    return view.collect_system_metrics(rows)
 
 def _bootstrap_log_lines() -> None:
-    if _LIVE_LOG_LINES:
-        return
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
-    if not os.path.isfile(path):
-        return
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            lines = handle.readlines()[-260:]
-        for line in lines:
-            _LIVE_LOG_LINES.append(line.rstrip("\r\n"))
-    except Exception:
-        logging.exception("Desktop UI: could not bootstrap bot.log history")
-
+    view.bootstrap_log_lines()
 
 def _install_live_log_handler() -> None:
-    global _LOG_HANDLER_INSTALLED
-    if _LOG_HANDLER_INSTALLED:
-        return
-    handler = _UiLogHandler(level=logging.INFO)
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-    logging.getLogger().addHandler(handler)
-    _LOG_HANDLER_INSTALLED = True
-
+    view.install_live_log_handler()
 
 def _hide_console_window() -> None:
     global _CONSOLE_HIDDEN
@@ -659,12 +610,7 @@ def _status_for(name: str) -> Tuple[str, str, str]:
 
 
 def _feedback(name: str, status: str, message: str) -> None:
-    _ACTION_FEEDBACK[name] = {
-        "status": status,
-        "message": _clean(message),
-        "timestamp": int(time.time()),
-    }
-
+    view.feedback(name, status, message)
 
 def _settings_for(name: str) -> Dict[str, str | bool]:
     cfg = SERVER_CONFIGS.get(name, {})
@@ -697,13 +643,7 @@ async def _refresh_discord_panel() -> None:
 
 
 async def _safe_refresh_discord_panel(timeout: float = 8.0) -> None:
-    try:
-        await asyncio.wait_for(_refresh_discord_panel(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logging.warning("Desktop UI: Discord refresh timeout after %.1fs", timeout)
-    except Exception:
-        logging.exception("Desktop UI: Discord refresh failed")
-
+    await view.safe_refresh(timeout)
 
 def _schedule_discord_refresh() -> None:
     try:
@@ -755,139 +695,17 @@ async def _wait_busy_or_done(name: str, task: asyncio.Task) -> None:
 
 
 async def _collect_servers(reload_config: bool = False) -> List[Dict[str, object]]:
-    if reload_config:
-        load_server_paths()
-        load_server_configs()
-
-    out: List[Dict[str, object]] = []
-    rest_tasks: List[Tuple[Dict[str, object], asyncio.Task]] = []
-    names = sorted(SERVER_PATHS.keys(), key=lambda item: str(item).lower())
-    for index, name in enumerate(names, start=1):
-        status_label, state_key, detail = _status_for(name)
-        fb = _ACTION_FEEDBACK.get(name)
-        feedback = f"[{fb.get('status')}] {fb.get('message')}" if fb else ""
-        running = _is_running(name)
-
-        row = {
-            "id": index,
-            "name": name,
-            "status": status_label,
-            "state": state_key,
-            "detail": detail,
-            "running": running,
-            "feedback": feedback,
-            "settings": _settings_for(name),
-            "resources": dict(_SERVER_RESOURCE_CACHE.get(name, {})),
-        }
-        out.append(row)
-        cfg = SERVER_CONFIGS.get(name, {})
-        if isinstance(cfg, dict):
-            rest_tasks.append((row, asyncio.create_task(collect_rest_snapshot(name, cfg, running))))
-
-    if rest_tasks:
-        for row, task in rest_tasks:
-            try:
-                row["rest"] = await task
-            except Exception as exc:
-                row["rest"] = {
-                    "configured": False,
-                    "enabled": False,
-                    "available": False,
-                    "status": "error",
-                    "summary": [],
-                    "sections": {},
-                    "errors": {"bridge": _clean(str(exc), 120)},
-                    "updated_at": None,
-                }
-    return out
-
+    return await view.collect_servers(reload_config=reload_config)
 
 def _collect_history(limit: int = 90) -> List[Tuple[str, str, str, str, str]]:
-    conn = None
-    rows: List[Tuple[str, str, str, str, str]] = []
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT timestamp, action, server, status, details FROM logs ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        rows = cur.fetchall()
-    except Exception:
-        logging.exception("Desktop UI: could not load history")
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-    return rows
-
+    return view.collect_history(limit)
 
 async def _run_action(name: str, action: str) -> Tuple[bool, str]:
-    ok = False
-    message = ""
-    try:
-        if action == "start":
-            task = asyncio.create_task(start_server(name))
-            await _wait_busy_or_done(name, task)
-            await _safe_refresh_discord_panel()
-            ok = await task
-            message = "Server started" if ok else "Start failed"
-
-        elif action == "stop":
-            task = asyncio.create_task(stop_server(name))
-            await _wait_busy_or_done(name, task)
-            await _safe_refresh_discord_panel()
-            ok = await task
-            message = "Server stopped" if ok else "Stop failed"
-
-        elif action == "update":
-            task = asyncio.create_task(run_update(name))
-            await _wait_busy_or_done(name, task)
-            await _safe_refresh_discord_panel()
-            ok, msg = await task
-            message = msg or ("Update completed" if ok else "Update failed")
-
-        elif action == "restart":
-            if _is_running(name):
-                stop_task = asyncio.create_task(stop_server(name))
-                await _wait_busy_or_done(name, stop_task)
-                await _safe_refresh_discord_panel()
-                if not await stop_task:
-                    ok = False
-                    message = "Restart failed while stopping"
-                    _feedback(name, "failed", message)
-                    return ok, message
-
-            start_task = asyncio.create_task(start_server(name))
-            await _wait_busy_or_done(name, start_task)
-            await _safe_refresh_discord_panel()
-            ok = await start_task
-            message = "Server restarted" if ok else "Restart failed while starting"
-            write_action_log("ui_restart", name, "success" if ok else "failed", message)
-
-        else:
-            message = f"Unknown action: {action}"
-
-        _feedback(name, "success" if ok else "failed", message)
-        return ok, message
-    except Exception as exc:
-        logging.exception("Desktop UI action failed: %s %s", action, name)
-        message = str(exc)
-        _feedback(name, "failed", message)
-        _schedule_discord_refresh()
-        return False, message
-    finally:
-        _schedule_discord_refresh()
+    return await dgsm_ops.run_action(name, action)
 
 
 async def _run_cli_user_command(command_line: str) -> Tuple[bool, str]:
-    result = await execute_cli_command(command_line, source="desktop-ui")
-    if result.refresh:
-        await _safe_refresh_discord_panel()
-    return result.ok, result.message
-
+    return await view.run_cli_user_command(command_line, source="desktop-ui")
 
 async def _save_settings(
     name: str,
@@ -899,383 +717,23 @@ async def _save_settings(
     stop_time: str,
     auto_start: bool = False,
 ) -> Tuple[bool, str]:
-    def _fail(message: str) -> Tuple[bool, str]:
-        _feedback(name, "failed", message)
-        try:
-            write_action_log("ui_updatesettings", name, "failed", message)
-        except Exception:
-            pass
-        _schedule_discord_refresh()
-        return False, message
-
-    try:
-        load_server_paths()
-        if name not in SERVER_PATHS:
-            return _fail(f"Unknown server: {name}")
-
-        normalized_stop_time = str(stop_time or "").strip()
-        if normalized_stop_time and not _STOP_TIME_RE.match(normalized_stop_time):
-            return _fail("Invalid stop time. Use HH:MM or leave empty.")
-
-        params_text = str(parameters or "").strip()
-        try:
-            param_list = shlex.split(params_text, posix=False) if params_text else []
-        except ValueError as exc:
-            return _fail(f"Invalid parameters: {exc}")
-
-        path = os.path.join(SERVER_PATHS[name], "server_settings.json")
-        cfg: Dict[str, object] = {}
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8-sig") as handle:
-                    raw = json.load(handle)
-                if isinstance(raw, dict):
-                    cfg = raw
-            except Exception:
-                cfg = {}
-
-        cfg["executable"] = str(executable or "").strip()
-        cfg["parameters"] = param_list
-        cfg["auto_start"] = bool(auto_start)
-        cfg["auto_update"] = bool(auto_update)
-        cfg["auto_restart"] = bool(auto_restart)
-        cfg["restart_after_stop"] = bool(restart_after_stop)
-        cfg["stop_time"] = normalized_stop_time
-
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(cfg, handle, indent=4)
-
-        load_server_configs()
-        write_action_log(
-            "ui_updatesettings",
-            name,
-            "success",
-            (
-                f"auto_start={auto_start} auto_update={auto_update} auto_restart={auto_restart} "
-                f"restart_after_stop={restart_after_stop} stop_time='{normalized_stop_time or '-'}'"
-            ),
-        )
-        _feedback(name, "success", "Settings saved")
-        _schedule_discord_refresh()
-        return True, "Settings saved"
-    except Exception as exc:
-        logging.exception("Desktop UI save settings failed: %s", name)
-        return _fail(str(exc))
-
-
-def _backup_dir() -> str:
-    path = os.path.join(BASE_DIR, "steam", "backup")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _legacy_backup_dir() -> str:
-    return os.path.join(BASE_DIR, "backups")
-
-
-def _backup_search_dirs() -> List[str]:
-    dirs = [_backup_dir()]
-    legacy = _legacy_backup_dir()
-    if os.path.isdir(legacy):
-        dirs.append(legacy)
-    return dirs
+    return await dgsm_ops.save_settings(
+        name=name,
+        executable=executable,
+        parameters=parameters,
+        auto_start=auto_start,
+        auto_update=auto_update,
+        auto_restart=auto_restart,
+        restart_after_stop=restart_after_stop,
+        stop_time=stop_time,
+    )
 
 
 def _list_backup_files() -> List[str]:
-    files: List[str] = []
-    seen = set()
-    for d in _backup_search_dirs():
-        try:
-            for entry in os.listdir(d):
-                key = entry.lower()
-                if key in seen:
-                    continue
-                if key.endswith(".zip") and os.path.isfile(os.path.join(d, entry)):
-                    files.append(entry)
-                    seen.add(key)
-        except Exception:
-            continue
-    files.sort(reverse=True)
-    return files
-
-
-def _resolve_backup_path(name: str) -> Optional[str]:
-    filename = os.path.basename(str(name or "").strip())
-    if not filename:
-        return None
-    for d in _backup_search_dirs():
-        path = os.path.abspath(os.path.join(d, filename))
-        root = os.path.abspath(d)
-        try:
-            if os.path.commonpath([root, path]) != root:
-                continue
-        except Exception:
-            continue
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def _backup_display(path: str) -> str:
-    filename = os.path.basename(path)
-    full = os.path.abspath(path)
-    primary = os.path.abspath(_backup_dir())
-    legacy = os.path.abspath(_legacy_backup_dir())
-    try:
-        if os.path.commonpath([primary, full]) == primary:
-            return f"/steam/backup/{filename}"
-    except Exception:
-        pass
-    try:
-        if os.path.commonpath([legacy, full]) == legacy:
-            return f"/backups/{filename}"
-    except Exception:
-        pass
-    return filename
-
-
-def _zip_members_are_safe(zip_ref: zipfile.ZipFile, target_dir: str) -> bool:
-    target_root = os.path.abspath(target_dir)
-    for member in zip_ref.namelist():
-        target_path = os.path.abspath(os.path.join(target_dir, member))
-        try:
-            if os.path.commonpath([target_root, target_path]) != target_root:
-                return False
-        except Exception:
-            return False
-    return True
-
-
-def _delete_root_from_server_path(path: str) -> str:
-    p = os.path.abspath(path)
-    if os.path.basename(p).lower() == "serverfiles":
-        return os.path.dirname(p)
-    return p
-
-
-def _rmtree_onerror(func, path, exc_info) -> None:  # type: ignore[no-untyped-def]
-    err = exc_info
-    if isinstance(exc_info, tuple):
-        err = exc_info[1] if len(exc_info) > 1 else None
-    if isinstance(err, PermissionError):
-        try:
-            mode = stat.S_IWRITE | stat.S_IREAD
-            if os.path.isdir(path):
-                mode |= stat.S_IEXEC
-            os.chmod(path, mode)
-            result = func(path)
-            if hasattr(result, "close"):
-                try:
-                    result.close()
-                except Exception:
-                    pass
-            return
-        except Exception:
-            pass
-    if err is not None:
-        raise err
-    raise RuntimeError(f"Could not remove path: {path}")
-
-
-def _blocking_rmtree(path: str) -> None:
-    if os.name == "nt":
-        try:
-            shutil.rmtree(path, onexc=_rmtree_onerror)  # Python 3.12+
-            return
-        except TypeError:
-            shutil.rmtree(path, onerror=_rmtree_onerror)
-            return
-    shutil.rmtree(path)
-
-
-async def _rmtree_with_retry(path: str, retries: int = 5, base_delay: float = 0.35) -> None:
-    last_exc: Optional[BaseException] = None
-    for attempt in range(retries):
-        try:
-            await asyncio.to_thread(_blocking_rmtree, path)
-            return
-        except FileNotFoundError:
-            return
-        except PermissionError as exc:
-            last_exc = exc
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == 5:
-                last_exc = exc
-            else:
-                raise
-        await asyncio.sleep(base_delay * (attempt + 1))
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"Could not delete '{path}'")
-
-
-def _is_access_denied_error(exc: BaseException) -> bool:
-    if isinstance(exc, PermissionError):
-        return True
-    if getattr(exc, "winerror", None) == 5:
-        return True
-    msg = str(exc).lower()
-    if "winerror 5" in msg or "access denied" in msg or "zugriff verweigert" in msg:
-        return True
-    return False
-
-
-def _chmod_tree_writable(path: str) -> None:
-    root = os.path.abspath(path)
-    if not os.path.exists(root):
-        return
-    for base, dirs, files in os.walk(root, topdown=False):
-        for name in files:
-            p = os.path.join(base, name)
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-            except Exception:
-                pass
-        for name in dirs:
-            p = os.path.join(base, name)
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-            except Exception:
-                pass
-    try:
-        mode = stat.S_IWRITE | stat.S_IREAD
-        if os.path.isdir(root):
-            mode |= stat.S_IEXEC
-        os.chmod(root, mode)
-    except Exception:
-        pass
-
-
-def _extract_zip_archive_safe(archive_path: str, target_dir: str, skip_access_denied: bool = False) -> List[str]:
-    skipped: List[str] = []
-    root = os.path.abspath(target_dir)
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        if not _zip_members_are_safe(archive, root):
-            raise RuntimeError("Backup archive contains invalid paths")
-        for info in archive.infolist():
-            name = info.filename or ""
-            if not name:
-                continue
-            dest = os.path.abspath(os.path.join(root, name))
-            try:
-                if os.path.commonpath([root, dest]) != root:
-                    raise RuntimeError("Backup archive contains invalid paths")
-            except Exception:
-                raise RuntimeError("Backup archive contains invalid paths")
-
-            if info.is_dir() or name.endswith("/"):
-                try:
-                    os.makedirs(dest, exist_ok=True)
-                    os.chmod(dest, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-                except Exception as exc:
-                    if skip_access_denied and _is_access_denied_error(exc):
-                        skipped.append(name)
-                        continue
-                    raise
-                continue
-
-            parent = os.path.dirname(dest)
-            try:
-                os.makedirs(parent, exist_ok=True)
-                os.chmod(parent, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-            try:
-                if os.path.isdir(dest):
-                    _blocking_rmtree(dest)
-                elif os.path.exists(dest):
-                    try:
-                        os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
-                    except Exception:
-                        pass
-                    os.remove(dest)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-
-            try:
-                with archive.open(info, "r") as src, open(dest, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-    return skipped
-
-
-def _create_directory_backup(path: str, server_name: str) -> str:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = os.path.join(_backup_dir(), f"{sanitize_instance_id(server_name)}-{stamp}")
-    return shutil.make_archive(base, "zip", root_dir=path)
-
-
-def _make_instance_id(cfg: dict, app_id: str, preferred: str) -> str:
-    base = sanitize_instance_id(preferred)
-    used = set()
-    for entry in cfg.get("server_paths", {}).values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("app_id")) != str(app_id):
-            continue
-        iid = entry.get("instance_id")
-        if isinstance(iid, str) and iid.strip():
-            used.add(sanitize_instance_id(iid))
-    if base not in used:
-        return base
-    n = 2
-    while f"{base}-{n}" in used:
-        n += 1
-    return f"{base}-{n}"
-
-
-def _instance_id_exists(cfg: dict, app_id: str, instance_id: str) -> bool:
-    wanted = sanitize_instance_id(instance_id)
-    for entry in cfg.get("server_paths", {}).values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("app_id")) != str(app_id):
-            continue
-        existing = entry.get("instance_id")
-        if isinstance(existing, str) and sanitize_instance_id(existing) == wanted:
-            return True
-    return False
-
-
-def _target_server_path(server_name: str, cfg: Optional[dict] = None) -> Optional[str]:
-    if server_name in SERVER_PATHS:
-        return SERVER_PATHS[server_name]
-    if cfg is None:
-        cfg = load_config()
-    entry = cfg.get("server_paths", {}).get(server_name)
-    if not isinstance(entry, dict):
-        return None
-    app_id = str(entry.get("app_id", "")).strip()
-    if not app_id:
-        return None
-    iid = entry.get("instance_id")
-    if isinstance(iid, str) and iid.strip():
-        return os.path.join(str(server_root(app_id, instance_id=iid)), "serverfiles")
-    return os.path.join(str(server_root(app_id)), "serverfiles")
-
+    return view.list_backup_files()
 
 def _list_templates() -> List[str]:
-    out: List[str] = []
-    try:
-        for entry in os.listdir(PLUGIN_TEMPLATES_DIR):
-            full = os.path.join(PLUGIN_TEMPLATES_DIR, entry)
-            if os.path.isdir(full):
-                out.append(entry)
-    except Exception:
-        return []
-    out.sort(key=str.lower)
-    return out
-
+    return view.list_templates()
 
 async def _create_template_action(
     template_name: str,
@@ -1290,373 +748,48 @@ async def _create_template_action(
     password: str = "",
     auto_start: bool = False,
 ) -> Tuple[bool, str]:
-    name = sanitize_instance_id(template_name)
-    if not template_name.strip():
-        return False, "Template name required"
-    if not app_id.strip():
-        return False, "Steam App ID required"
-
-    stop = str(stop_time or "").strip()
-    if stop and not _STOP_TIME_RE.match(stop):
-        return False, "Invalid stop time. Use HH:MM or leave empty."
-
-    params_text = str(parameters or "").strip()
-    try:
-        param_list = shlex.split(params_text) if params_text else []
-    except Exception as exc:
-        return False, f"Invalid parameters: {exc}"
-
-    try:
-        template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template_name.strip())
-        cfg = build_template_config(
-            app_id=app_id.strip(),
-            executable=executable.strip(),
-            parameters=param_list,
-            auto_start=bool(auto_start),
-            auto_update=bool(auto_update),
-            auto_restart=bool(auto_restart),
-            stop_time=stop,
-            restart_after_stop=bool(restart_after_stop),
-            username=username.strip(),
-            password=password.strip(),
-        )
-        write_template_files(template_dir, cfg)
-        write_action_log("ui_createtemplate", name, "success", f"app_id={app_id.strip()}")
-        _schedule_discord_refresh()
-        return True, f"Template '{template_name.strip()}' saved"
-    except Exception as exc:
-        write_action_log("ui_createtemplate", name, "failed", str(exc))
-        _schedule_discord_refresh()
-        return False, str(exc)
+    return await dgsm_ops.create_template(
+        template_name=template_name,
+        app_id=app_id,
+        executable=executable,
+        parameters=parameters,
+        auto_start=auto_start,
+        auto_update=auto_update,
+        auto_restart=auto_restart,
+        stop_time=stop_time,
+        restart_after_stop=restart_after_stop,
+        username=username,
+        password=password,
+    )
 
 
-async def _import_wgsm_plugin_action(
-    source: str,
-    template_name: str = "",
-    *,
-    allow_local: bool = True,
-) -> Tuple[bool, str]:
-    source_value = str(source or "").strip()
-    if not source_value:
-        return False, "WindowsGSM plugin source required"
-    try:
-        report = await asyncio.to_thread(
-            import_wgsm_plugin,
-            source_value,
-            PLUGIN_TEMPLATES_DIR,
-            template_name=str(template_name or "").strip(),
-            allow_local=allow_local,
-        )
-        message = format_import_summary(report)
-        write_action_log("ui_importwgsm", str(report.get("template_name", "-")), "success", message)
-        _schedule_discord_refresh()
-        return True, message
-    except Exception as exc:
-        logging.exception("WindowsGSM plugin import failed")
-        write_action_log("ui_importwgsm", str(template_name or "-") or "-", "failed", str(exc))
-        return False, str(exc)
+async def _import_wgsm_plugin_action(source: str, template_name: str = "", *, allow_local: bool = True) -> Tuple[bool, str]:
+    return await dgsm_ops.import_wgsm_plugin_action(
+        source=source, template_name=template_name, allow_local=allow_local
+    )
 
 
 async def _add_server_action(
-    name: str,
-    template_name: str,
-    instance_id: str = "",
-    start_after_install: bool = True,
+    name: str, template_name: str, instance_id: str = "", start_after_install: bool = True
 ) -> Tuple[bool, str]:
-    server_name = name.strip()
-    if not server_name:
-        return False, "Server name required"
-    if not template_name.strip():
-        return False, "Template required"
-
-    try:
-        template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template_name.strip())
-        cfg_path = os.path.join(template_dir, "config.json")
-        if not os.path.isfile(cfg_path):
-            return False, "Template config.json not found"
-        tcfg = read_template_config(template_dir)
-        write_template_files(template_dir, tcfg)
-
-        app_id = str(tcfg.get("app_id", "")).strip()
-        executable = template_effective_executable(tcfg)
-        if not app_id:
-            return False, "Template missing app_id"
-
-        cfg = load_config()
-        if server_name in cfg.get("server_paths", {}):
-            return False, f"Server '{server_name}' already exists"
-
-        if instance_id.strip():
-            chosen = sanitize_instance_id(instance_id)
-            if _instance_id_exists(cfg, app_id, chosen):
-                return False, f"Instance ID '{chosen}' already exists for app_id {app_id}"
-        else:
-            chosen = _make_instance_id(cfg, app_id, server_name)
-
-        server_dir = os.path.join(str(server_root(app_id, instance_id=chosen)), "serverfiles")
-        os.makedirs(server_dir, exist_ok=True)
-
-        for item in os.listdir(template_dir):
-            if item == "config.json":
-                continue
-            src = os.path.join(template_dir, item)
-            dst = os.path.join(server_dir, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-
-        settings = template_settings_from_config(tcfg)
-        with open(os.path.join(server_dir, "server_settings.json"), "w", encoding="utf-8") as handle:
-            json.dump(settings, handle, indent=4)
-
-        entry = {"app_id": app_id, "instance_id": chosen}
-        if executable:
-            entry["executable"] = executable
-        if tcfg.get("username") and tcfg.get("password"):
-            entry["username"] = str(tcfg["username"])
-            entry["password"] = encrypt_value(str(tcfg["password"]))
-        cfg.setdefault("server_paths", {})[server_name] = entry
-        save_config(cfg)
-        load_server_paths()
-        load_server_configs()
-
-        ok_update, msg_update = await run_update(server_name)
-        if not ok_update:
-            write_action_log("ui_addserver", server_name, "failed", msg_update)
-            _schedule_discord_refresh()
-            return False, f"Install failed: {msg_update}"
-
-        await asyncio.to_thread(ensure_server_executable_hint, server_name)
-        if start_after_install:
-            ok_start = await start_server(server_name)
-            if not ok_start:
-                write_action_log("ui_addserver", server_name, "failed", "installed, start failed")
-                _schedule_discord_refresh()
-                return False, "Installed but start failed"
-
-        write_action_log("ui_addserver", server_name, "success", f"template={template_name} instance={chosen}")
-        _schedule_discord_refresh()
-        return True, f"Server '{server_name}' installed"
-    except Exception as exc:
-        write_action_log("ui_addserver", name or "-", "failed", str(exc))
-        _schedule_discord_refresh()
-        return False, str(exc)
+    return await dgsm_ops.add_server(
+        name=name,
+        template_name=template_name,
+        instance_id=instance_id,
+        start_after_install=start_after_install,
+    )
 
 
 async def _create_backup_action(server_name: str) -> Tuple[bool, str]:
-    name = server_name.strip()
-    if not name:
-        return False, "Server required"
-    load_server_paths()
-    cfg = load_config()
-    if name not in cfg.get("server_paths", {}) and name not in SERVER_PATHS:
-        return False, "Server not found"
-
-    target = _target_server_path(name, cfg)
-    if not target:
-        return False, "Server path not found"
-    backup_root = _delete_root_from_server_path(target)
-    if not os.path.exists(backup_root):
-        return False, f"Backup path missing: {backup_root}"
-
-    success = False
-    fail_reason = ""
-    status_finalized = False
-    begin_operation(name, "backup")
-    await _safe_refresh_discord_panel()
-    try:
-        archive = await asyncio.to_thread(_create_directory_backup, backup_root, name)
-        write_action_log("ui_createbackup", name, "success", os.path.basename(archive))
-        _feedback(name, "success", f"Backup created: {_backup_display(archive)}")
-        success = True
-        end_operation_success(name)
-        status_finalized = True
-        await _safe_refresh_discord_panel()
-        return True, f"Backup created: {_backup_display(archive)}"
-    except Exception as exc:
-        fail_reason = str(exc)
-        write_action_log("ui_createbackup", name, "failed", fail_reason)
-        _feedback(name, "failed", fail_reason)
-        return False, fail_reason
-    finally:
-        if not status_finalized:
-            if success:
-                end_operation_success(name)
-            else:
-                end_operation_failed(name, fail_reason or "Backup failed")
-            await _safe_refresh_discord_panel()
+    return await dgsm_ops.create_backup(server_name)
 
 
 async def _restore_backup_action(name: str, backup_file: str, overwrite: bool = False) -> Tuple[bool, str]:
-    server_name = name.strip()
-    if not server_name:
-        return False, "Server required"
-    load_server_paths()
-    cfg = load_config()
-    if server_name not in cfg.get("server_paths", {}) and server_name not in SERVER_PATHS:
-        return False, "Server not found"
-
-    archive_path = _resolve_backup_path(backup_file)
-    if not archive_path:
-        return False, "Backup file not found"
-
-    if _is_running(server_name):
-        return False, "Restore not possible while server is running"
-
-    target = _target_server_path(server_name, cfg)
-    if not target:
-        return False, "Server path not found"
-    restore_root = _delete_root_from_server_path(target)
-    restore_root_norm = os.path.normcase(os.path.abspath(restore_root))
-    if overwrite:
-        for other_name, other_path in SERVER_PATHS.items():
-            if other_name == server_name:
-                continue
-            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
-            if other_root == restore_root_norm or other_root.startswith(restore_root_norm + os.sep):
-                return False, f"Overwrite denied: folder is shared with {other_name}"
-    if os.path.exists(restore_root) and not overwrite:
-        try:
-            if any(os.scandir(restore_root)):
-                return False, "Target folder is not empty. Use overwrite."
-        except Exception:
-            pass
-
-    success = False
-    fail_reason = ""
-    status_finalized = False
-    begin_operation(server_name, "restore")
-    await _safe_refresh_discord_panel()
-    try:
-        merge_fallback = False
-        skipped_locked_entries: List[str] = []
-        if os.path.exists(restore_root) and overwrite:
-            try:
-                await asyncio.to_thread(_chmod_tree_writable, restore_root)
-                await _rmtree_with_retry(restore_root)
-            except Exception as cleanup_exc:
-                if _is_access_denied_error(cleanup_exc):
-                    merge_fallback = True
-                    logging.warning("Desktop UI restore cleanup fallback for %s: %s", server_name, cleanup_exc)
-                else:
-                    raise
-        os.makedirs(restore_root, exist_ok=True)
-        last_extract_error: Optional[BaseException] = None
-        for attempt in range(2):
-            try:
-                skip_locked = attempt >= 1
-                skipped_items = await asyncio.to_thread(
-                    _extract_zip_archive_safe,
-                    archive_path,
-                    restore_root,
-                    skip_locked,
-                )
-                if skipped_items:
-                    skipped_locked_entries.extend(item for item in skipped_items if item not in skipped_locked_entries)
-                    write_action_log(
-                        "ui_restorebackup",
-                        server_name,
-                        "warning",
-                        f"skipped locked entries: {', '.join(skipped_items[:6])}",
-                    )
-                last_extract_error = None
-                break
-            except Exception as extract_exc:
-                last_extract_error = extract_exc
-                if _is_access_denied_error(extract_exc):
-                    await asyncio.to_thread(_chmod_tree_writable, restore_root)
-                    await asyncio.sleep(0.45)
-                    continue
-                if attempt >= 1:
-                    raise
-        if last_extract_error is not None:
-            raise last_extract_error
-        load_server_paths()
-        load_server_configs()
-        write_action_log("ui_restorebackup", server_name, "success", os.path.basename(archive_path))
-        _feedback(server_name, "success", f"Backup restored: {_backup_display(archive_path)}")
-        success = True
-        end_operation_success(server_name)
-        status_finalized = True
-        await _safe_refresh_discord_panel()
-        if skipped_locked_entries:
-            return True, f"Backup restored with skipped locked paths: {', '.join(skipped_locked_entries[:4])}"
-        return True, f"Backup restored: {_backup_display(archive_path)}"
-    except Exception as exc:
-        fail_reason = str(exc)
-        if _is_access_denied_error(exc):
-            try:
-                await asyncio.to_thread(_chmod_tree_writable, restore_root)
-            except Exception:
-                pass
-            fail_reason = (
-                f"{fail_reason} (access denied). Close file handles in the target folder "
-                "and retry with overwrite enabled."
-            )
-        write_action_log("ui_restorebackup", server_name, "failed", fail_reason)
-        _feedback(server_name, "failed", fail_reason)
-        return False, fail_reason
-    finally:
-        if not status_finalized:
-            if success:
-                end_operation_success(server_name)
-            else:
-                end_operation_failed(server_name, fail_reason or "Restore failed")
-            await _safe_refresh_discord_panel()
+    return await dgsm_ops.restore_backup(name, backup_file, overwrite=overwrite)
 
 
 async def _remove_server_action(name: str, backup_before_delete: bool = True) -> Tuple[bool, str]:
-    server_name = name.strip()
-    if not server_name:
-        return False, "Server required"
-
-    try:
-        cfg = load_config()
-        if server_name not in cfg.get("server_paths", {}):
-            return False, "Server not found"
-
-        if _is_running(server_name):
-            await stop_server(server_name)
-
-        target = _target_server_path(server_name, cfg)
-        if not target:
-            return False, "Server path not found"
-        delete_root = _delete_root_from_server_path(target)
-        delete_norm = os.path.normcase(os.path.abspath(delete_root))
-
-        load_server_paths()
-        shared_with = None
-        for other_name, other_path in SERVER_PATHS.items():
-            if other_name == server_name:
-                continue
-            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
-            if other_root == delete_norm or other_root.startswith(delete_norm + os.sep):
-                shared_with = other_name
-                break
-
-        if os.path.exists(delete_root) and not shared_with:
-            if backup_before_delete:
-                archive_path = await asyncio.to_thread(_create_directory_backup, delete_root, server_name)
-                write_action_log("ui_removebackup", server_name, "success", os.path.basename(archive_path))
-            await _rmtree_with_retry(delete_root)
-
-        cfg = load_config()
-        cfg.get("server_paths", {}).pop(server_name, None)
-        save_config(cfg)
-        load_server_paths()
-        load_server_configs()
-        clear_server_status(server_name)
-
-        write_action_log("ui_removeserver", server_name, "success", f"shared_with={shared_with or '-'}")
-        _schedule_discord_refresh()
-        if shared_with:
-            return True, f"Server removed (folder kept, shared with {shared_with})"
-        return True, "Server removed"
-    except Exception as exc:
-        write_action_log("ui_removeserver", server_name or "-", "failed", str(exc))
-        _schedule_discord_refresh()
-        return False, str(exc)
+    return await dgsm_ops.remove_server(name, backup_before_delete=backup_before_delete)
 
 
 def _build_qss() -> str:
@@ -3213,6 +2346,7 @@ def start_desktop_ui(
         _LOOP = loop
         if refresh_callback is not None:
             _REFRESH_CALLBACK = refresh_callback
+            view.configure_refresh_callback(refresh_callback)
 
         _bootstrap_log_lines()
         _install_live_log_handler()

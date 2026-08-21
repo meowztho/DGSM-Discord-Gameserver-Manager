@@ -53,6 +53,7 @@ from runtime_status import (
 )
 from cli_commands import execute_cli_command
 from wgsm_import import format_import_summary, import_wgsm_plugin
+import dgsm_operations as dgsm_ops
 
 
 # ---------- helper: robust defer & reply ----------
@@ -162,280 +163,6 @@ def _notify_desktop_ui_refresh(reason: str = "") -> None:
         pass
 
 
-def _make_instance_id(cfg: dict, app_id: str, preferred: str) -> str:
-    base = sanitize_instance_id(preferred)
-    used = set()
-    for entry in cfg.get("server_paths", {}).values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("app_id")) != str(app_id):
-            continue
-        iid = entry.get("instance_id")
-        if isinstance(iid, str) and iid.strip():
-            used.add(sanitize_instance_id(iid))
-    if base not in used:
-        return base
-    n = 2
-    while f"{base}-{n}" in used:
-        n += 1
-    return f"{base}-{n}"
-
-
-def _instance_id_exists(cfg: dict, app_id: str, instance_id: str) -> bool:
-    wanted = sanitize_instance_id(instance_id)
-    for entry in cfg.get("server_paths", {}).values():
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("app_id")) != str(app_id):
-            continue
-        existing = entry.get("instance_id")
-        if isinstance(existing, str) and sanitize_instance_id(existing) == wanted:
-            return True
-    return False
-
-
-def _delete_root_from_server_path(path: str) -> str:
-    p = os.path.abspath(path)
-    if os.path.basename(p).lower() == "serverfiles":
-        return os.path.dirname(p)
-    return p
-
-
-def _rmtree_onerror(func, path, exc_info):
-    err = exc_info
-    if isinstance(exc_info, tuple):
-        err = exc_info[1] if len(exc_info) > 1 else None
-    if isinstance(err, PermissionError):
-        try:
-            mode = stat.S_IWRITE | stat.S_IREAD
-            if os.path.isdir(path):
-                mode |= stat.S_IEXEC
-            os.chmod(path, mode)
-            result = func(path)
-            if hasattr(result, "close"):
-                try:
-                    result.close()
-                except Exception:
-                    pass
-            return
-        except Exception:
-            pass
-    if err is not None:
-        raise err
-    raise RuntimeError(f"Pfad konnte nicht gelöscht werden: {path}")
-
-
-def _blocking_rmtree(path: str) -> None:
-    import shutil
-
-    if os.name == "nt":
-        try:
-            shutil.rmtree(path, onexc=_rmtree_onerror)  # Python 3.12+
-            return
-        except TypeError:
-            shutil.rmtree(path, onerror=_rmtree_onerror)
-            return
-    shutil.rmtree(path)
-
-
-async def _rmtree_with_retry(path: str, retries: int = 5, base_delay: float = 0.35) -> None:
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            await asyncio.to_thread(_blocking_rmtree, path)
-            return
-        except FileNotFoundError:
-            return
-        except PermissionError as exc:
-            last_exc = exc
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == 5:
-                last_exc = exc
-            else:
-                raise
-        await asyncio.sleep(base_delay * (attempt + 1))
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"Pfad konnte nicht gelöscht werden: {path}")
-
-
-def _is_access_denied_error(exc: BaseException) -> bool:
-    if isinstance(exc, PermissionError):
-        return True
-    if getattr(exc, "winerror", None) == 5:
-        return True
-    msg = str(exc).lower()
-    return ("winerror 5" in msg) or ("access denied" in msg) or ("zugriff verweigert" in msg)
-
-
-def _chmod_tree_writable(path: str) -> None:
-    root = os.path.abspath(path)
-    if not os.path.exists(root):
-        return
-    for base, dirs, files in os.walk(root, topdown=False):
-        for name in files:
-            p = os.path.join(base, name)
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-            except Exception:
-                pass
-        for name in dirs:
-            p = os.path.join(base, name)
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-            except Exception:
-                pass
-    try:
-        mode = stat.S_IWRITE | stat.S_IREAD
-        if os.path.isdir(root):
-            mode |= stat.S_IEXEC
-        os.chmod(root, mode)
-    except Exception:
-        pass
-
-
-def _extract_zip_archive_safe(archive_path: str, target_dir: str, skip_access_denied: bool = False) -> List[str]:
-    skipped: List[str] = []
-    root = os.path.abspath(target_dir)
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        if not _zip_members_are_safe(archive, root):
-            raise RuntimeError("Backup enthält ungültige Pfade")
-
-        for info in archive.infolist():
-            name = info.filename or ""
-            if not name:
-                continue
-            dest = os.path.abspath(os.path.join(root, name))
-            try:
-                if os.path.commonpath([root, dest]) != root:
-                    raise RuntimeError("Backup enthält ungültige Pfade")
-            except Exception:
-                raise RuntimeError("Backup enthält ungültige Pfade")
-
-            if info.is_dir() or name.endswith("/"):
-                try:
-                    os.makedirs(dest, exist_ok=True)
-                    os.chmod(dest, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-                except Exception as exc:
-                    if skip_access_denied and _is_access_denied_error(exc):
-                        skipped.append(name)
-                        continue
-                    raise
-                continue
-
-            parent = os.path.dirname(dest)
-            try:
-                os.makedirs(parent, exist_ok=True)
-                os.chmod(parent, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-
-            try:
-                if os.path.isdir(dest):
-                    _blocking_rmtree(dest)
-                elif os.path.exists(dest):
-                    try:
-                        os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
-                    except Exception:
-                        pass
-                    os.remove(dest)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-
-            try:
-                with archive.open(info, "r") as src, open(dest, "wb") as dst:
-                    import shutil
-
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
-            except Exception as exc:
-                if skip_access_denied and _is_access_denied_error(exc):
-                    skipped.append(name)
-                    continue
-                raise
-    return skipped
-
-
-def _create_directory_backup(path: str, server_name: str) -> str:
-    import shutil
-
-    backup_dir = _backup_dir()
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_base = os.path.join(backup_dir, f"{sanitize_instance_id(server_name)}-{stamp}")
-    return shutil.make_archive(backup_base, "zip", root_dir=path)
-
-
-def _backup_dir() -> str:
-    backup_dir = os.path.join(BASE_DIR, "steam", "backup")
-    os.makedirs(backup_dir, exist_ok=True)
-    return backup_dir
-
-
-def _legacy_backup_dir() -> str:
-    return os.path.join(BASE_DIR, "backups")
-
-
-def _backup_search_dirs() -> List[str]:
-    dirs = [_backup_dir()]
-    legacy = _legacy_backup_dir()
-    if os.path.isdir(legacy):
-        dirs.append(legacy)
-    return dirs
-
-
-def _backup_display_path(path: str) -> str:
-    filename = os.path.basename(path)
-    full = os.path.abspath(path)
-    try:
-        primary = os.path.abspath(_backup_dir())
-        if os.path.commonpath([primary, full]) == primary:
-            return f"/steam/backup/{filename}"
-    except Exception:
-        pass
-    try:
-        legacy = os.path.abspath(_legacy_backup_dir())
-        if os.path.commonpath([legacy, full]) == legacy:
-            return f"/backups/{filename}"
-    except Exception:
-        pass
-    return filename
-
-
-def _resolve_backup_path(backup_file: str) -> Optional[str]:
-    backup_name = os.path.basename(str(backup_file or "").strip())
-    if not backup_name:
-        return None
-    for backup_dir in _backup_search_dirs():
-        candidate = os.path.abspath(os.path.join(backup_dir, backup_name))
-        backup_root = os.path.abspath(backup_dir)
-        try:
-            if os.path.commonpath([backup_root, candidate]) != backup_root:
-                continue
-        except Exception:
-            continue
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def _zip_members_are_safe(zip_ref: zipfile.ZipFile, target_dir: str) -> bool:
-    target_root = os.path.abspath(target_dir)
-    for member in zip_ref.namelist():
-        target_path = os.path.abspath(os.path.join(target_dir, member))
-        try:
-            if os.path.commonpath([target_root, target_path]) != target_root:
-                return False
-        except Exception:
-            return False
-    return True
-
-
-# --------------- autocomplete ---------------
 async def template_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoice]:
     try:
         items = [d for d in os.listdir(PLUGIN_TEMPLATES_DIR) if os.path.isdir(os.path.join(PLUGIN_TEMPLATES_DIR, d))]
@@ -454,18 +181,7 @@ async def backup_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionCh
     try:
         current = (ctx.value or "").lower()
         server_name = sanitize_instance_id(str(ctx.options.get("name", "") or "")).lower()
-        files = []
-        seen = set()
-        for backup_dir in _backup_search_dirs():
-            for entry in os.listdir(backup_dir):
-                full = os.path.join(backup_dir, entry)
-                key = entry.lower()
-                if key in seen:
-                    continue
-                if os.path.isfile(full) and key.endswith(".zip"):
-                    seen.add(key)
-                    files.append(entry)
-        files.sort(reverse=True)
+        files = dgsm_ops.list_backup_files()
         if server_name:
             matching = [f for f in files if server_name in f.lower()]
             non_matching = [f for f in files if server_name not in f.lower()]
@@ -607,26 +323,16 @@ async def create_template(
     password: Option(str, "Steam-Passwort", required=False, sensitive=True),
 ):
     await safe_defer(ctx, ephemeral=True)
-    try:
-        param_list = shlex.split(parameters) if parameters else []
-        template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template_name)
-        cfg = build_template_config(
-            app_id=app_id,
-            executable=executable or "",
-            parameters=param_list,
-            auto_start=auto_start,
-            auto_update=auto_update,
-            auto_restart=auto_restart,
-            stop_time=stop_time,
-            restart_after_stop=restart_after_stop,
-            username=username or "",
-            password=password or "",
-        )
-        write_template_files(template_dir, cfg)
+    ok, message = await dgsm_ops.create_template(
+        template_name=template_name, app_id=app_id, executable=executable or "",
+        parameters=parameters or "", auto_start=auto_start, auto_update=auto_update,
+        auto_restart=auto_restart, stop_time=stop_time, restart_after_stop=restart_after_stop,
+        username=username or "", password=password or "", surface_hooks=False,
+    )
+    if ok:
         await safe_send(ctx, f"✅ Template '{template_name}' erstellt/aktualisiert.", ephemeral=True)
-    except Exception as e:
-        await safe_send(ctx, f"❌ Fehler: {e}", ephemeral=True)
-
+    else:
+        await safe_send(ctx, f"❌ Fehler: {message}", ephemeral=True)
 
 @bot.slash_command(name="importwgsm", description="Importiert ein WindowsGSM-Plugin als DGSM-Template")
 @commands.has_role("Admin")
@@ -668,126 +374,65 @@ async def add_server(
     instance_id: Option(str, "Optionale Instanz-ID (z.B. pve-2)", required=False),
 ):
     await safe_defer(ctx, ephemeral=True)
-    try:
-        template_dir = os.path.join(PLUGIN_TEMPLATES_DIR, template)
-        if not os.path.exists(template_dir):
-            return await safe_send(ctx, f"❌ Template '{template}' existiert nicht!", ephemeral=True)
-        cfg_path = os.path.join(template_dir, "config.json")
-        if not os.path.exists(cfg_path):
-            return await safe_send(ctx, f"❌ Template '{template}' hat keine config.json!", ephemeral=True)
-        tcfg = read_template_config(template_dir)
-        write_template_files(template_dir, tcfg)
-        if not str(tcfg.get("app_id", "")).strip():
-            return await safe_send(ctx, "❌ Template unvollständig. Fehlend: app_id", ephemeral=True)
 
-        cfg = load_config()
-        if name in cfg["server_paths"]:
-            return await safe_send(ctx, f"Server '{name}' existiert bereits.", ephemeral=True)
-
-        app_id = str(tcfg["app_id"])
-        executable = template_effective_executable(tcfg)
-        if instance_id:
-            chosen_instance_id = sanitize_instance_id(instance_id)
-            if _instance_id_exists(cfg, app_id, chosen_instance_id):
-                return await safe_send(
-                    ctx,
-                    f"Instanz-ID '{chosen_instance_id}' ist für App-ID {app_id} bereits vergeben.",
-                    ephemeral=True,
-                )
-        else:
-            chosen_instance_id = _make_instance_id(cfg, app_id, name)
-
-        instance_id = chosen_instance_id
-        instance_root = server_root(app_id, instance_id=instance_id)
-        server_dir = os.path.join(str(instance_root), "serverfiles")
-        os.makedirs(server_dir, exist_ok=True)
-
-        for item in os.listdir(template_dir):
-            if item == "config.json":
-                continue
-            src = os.path.join(template_dir, item)
-            dst = os.path.join(server_dir, item)
-            if os.path.isdir(src):
-                from shutil import copytree
-                copytree(src, dst, dirs_exist_ok=True)
-            else:
-                from shutil import copy2
-                copy2(src, dst)
-
-        s_settings = template_settings_from_config(tcfg)
-        with open(os.path.join(server_dir, "server_settings.json"), "w", encoding="utf-8") as f:
-            json.dump(s_settings, f, indent=4)
-
-        entry = {"app_id": app_id, "instance_id": instance_id}
-        if executable:
-            entry["executable"] = executable
-        if tcfg.get("username") and tcfg.get("password"):
-            entry["username"] = tcfg["username"]
-            entry["password"] = encrypt_value(tcfg["password"])
-        cfg["server_paths"][name] = entry
-        save_config(cfg)
-
-        load_server_paths()
-        load_server_configs()
-
-        async def _run_update_with_panel() -> tuple[bool, str]:
-            update_task = asyncio.create_task(run_update(name))
-            for _ in range(20):
-                state, _detail = get_operation_status(name)
-                if state == "busy" or update_task.done():
-                    break
-                await asyncio.sleep(0.05)
+    async def _progress(event: str, data: dict) -> None:
+        if event == "install_start":
+            await safe_send(ctx, f"Starte Installation von **{name}** (Instanz: `{data.get('instance_id', '')}`)...", ephemeral=True)
+        elif event == "install_busy":
             await refresh_main_panel()
-            return await update_task
-
-        await safe_send(ctx, f"Starte Installation von **{name}** (Instanz: `{instance_id}`)...", ephemeral=True)
-        ok, message = await _run_update_with_panel()
-        if not ok:
-            # try anonymous fallback
-            if "No subscription" in message or "besitzt keine Lizenz" in message:
-                if "username" in cfg["server_paths"][name]:
-                    cfg["server_paths"][name].pop("username", None)
-                    cfg["server_paths"][name].pop("password", None)
-                    save_config(cfg)
-                ok, message = await _run_update_with_panel()
-        if not ok:
-            disk_free = 0.0
-            try:
-                import shutil
-                disk_free = shutil.disk_usage(server_dir).free / (1024 ** 3)
-            except Exception:
-                pass
+        elif event == "install_failed":
             debug = (
                 f"❌ **Fehler bei Installation von {name}**\n"
-                f"App-ID: `{app_id}`\n"
-                f"Installationsverzeichnis: `{server_dir}`\n"
-                f"Verfügbarer Speicher: `{disk_free:.2f} GB`\n"
-                f"Fehlermeldung: ```{message}```"
+                f"App-ID: `{data.get('app_id', '')}`\n"
+                f"Installationsverzeichnis: `{data.get('server_dir', '')}`\n"
+                f"Verfügbarer Speicher: `{float(data.get('disk_free', 0.0)):.2f} GB`\n"
+                f"Fehlermeldung: ```{data.get('message', '')}```"
             )
             await safe_send(ctx, debug, ephemeral=True)
-            write_action_log("install", name, "failed", message)
             await refresh_main_panel()
-            return
-
-        await asyncio.to_thread(ensure_server_executable_hint, name)
-        await safe_send(ctx, f"✅ Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
-        if not await start_server(name):
-            write_action_log("start_after_add", name, "failed")
+        elif event == "install_success_start":
+            await safe_send(ctx, f"✅ Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
+        elif event == "start_failed":
             await refresh_main_panel()
-            return await safe_send(ctx, "❌ Start fehlgeschlagen!", ephemeral=True)
+            await safe_send(ctx, "❌ Start fehlgeschlagen!", ephemeral=True)
+        elif event == "complete":
+            await refresh_main_panel()
+            await safe_send(
+                ctx,
+                f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{data.get('instance_id', '')}`).",
+                ephemeral=True,
+            )
 
-        write_action_log("start_after_add", name, "success")
-        await refresh_main_panel()
-        await safe_send(
-            ctx,
-            f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{instance_id}`).",
-            ephemeral=True,
+    try:
+        ok, message = await dgsm_ops.add_server(
+            name=name, template_name=template, instance_id=instance_id or "",
+            start_after_install=True, progress=_progress, surface_hooks=False,
         )
-
+        if ok:
+            return
+        # Preserve the established Discord-facing validation wording.
+        if message.startswith("Template '") and message.endswith("does not exist"):
+            return await safe_send(ctx, f"❌ Template '{template}' existiert nicht!", ephemeral=True)
+        if message.startswith("Template '") and message.endswith("has no config.json"):
+            return await safe_send(ctx, f"❌ Template '{template}' hat keine config.json!", ephemeral=True)
+        if message == "Template missing app_id":
+            return await safe_send(ctx, "❌ Template unvollständig. Fehlend: app_id", ephemeral=True)
+        if message == f"Server '{name}' already exists":
+            return await safe_send(ctx, f"Server '{name}' existiert bereits.", ephemeral=True)
+        if message.startswith("Instance ID '"):
+            chosen = sanitize_instance_id(instance_id or "")
+            app_id = "?"
+            try:
+                app_id = str(read_template_config(os.path.join(PLUGIN_TEMPLATES_DIR, template)).get("app_id", "?"))
+            except Exception:
+                pass
+            return await safe_send(ctx, f"Instanz-ID '{chosen}' ist für App-ID {app_id} bereits vergeben.", ephemeral=True)
+        if message.startswith("Install failed:") or message == "Installed but start failed":
+            return
+        await safe_send(ctx, f"❌ Kritischer Fehler: {message}", ephemeral=True)
     except Exception as e:
         logging.exception("Fehler in add_server")
         await safe_send(ctx, f"❌ Kritischer Fehler: {e}", ephemeral=True)
-
 
 @bot.slash_command(name="updateserver", description="Aktualisiert einen Eintrag in Config oder Settings")
 @commands.has_role("Admin")
@@ -812,21 +457,10 @@ async def update_server(
         new_val = ast.literal_eval(value)
     except Exception:
         new_val = value
-    if section == "config":
-        entry = cfg["server_paths"][server]
-        entry[key] = encrypt_value(str(new_val)) if key == "password" else new_val
-        save_config(cfg)
-        load_server_paths()
-        load_server_configs()
-    else:
-        sf = os.path.join(SERVER_PATHS[server], "server_settings.json")
-        s_cfg = json.load(open(sf, "r", encoding="utf-8-sig")) if os.path.exists(sf) else {}
-        s_cfg[key] = new_val
-        json.dump(s_cfg, open(sf, "w", encoding="utf-8"), indent=4)
-        load_server_configs()
-    write_action_log("updateserver", server, "success", f"{section}.{key}")
+    ok, message = dgsm_ops.update_server_value(server, section, key, new_val, surface_hooks=False)
+    if not ok:
+        return await safe_send(ctx, f"❌ {message}", ephemeral=True)
     await safe_send(ctx, f"✅ **{server}** {section}.{key} → {value}", ephemeral=True)
-
 
 @bot.slash_command(name="removeserver", description="Entfernt einen Server komplett")
 @commands.has_role("Admin")
@@ -837,65 +471,33 @@ async def remove_server(
     backup_before_delete: Option(bool, "Vor dem Löschen ein ZIP-Backup erstellen", default=True),
 ):
     await safe_defer(ctx, ephemeral=True)
-    try:
-        cfg = load_config()
-        if name not in cfg["server_paths"]:
-            return await safe_send(ctx, "Server nicht gefunden!", ephemeral=True)
 
-        load_server_paths()
-        target_server_path = SERVER_PATHS.get(name)
-        if not target_server_path:
-            app_id = str(cfg["server_paths"][name].get("app_id", ""))
-            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
-
-        if name in server_processes:
-            await stop_server(name)
+    async def _progress(event: str, data: dict) -> None:
+        if event == "stopped":
             await safe_send(ctx, f"Server **{name}** gestoppt.", ephemeral=True)
+        elif event == "shared_path":
+            await safe_send(ctx, f"Ordner bleibt erhalten, da auch `{data.get('shared_with', '')}` ihn nutzt: `{data.get('delete_root', '')}`", ephemeral=True)
+        elif event == "backup_created":
+            await safe_send(ctx, f"Backup erstellt: `{data.get('display_path', '')}`", ephemeral=True)
+        elif event == "backup_failed":
+            await safe_send(ctx, f"Backup fehlgeschlagen ({data.get('message', '')}). Entfernen wurde abgebrochen.", ephemeral=True)
+        elif event == "directory_deleted":
+            await safe_send(ctx, f"Server-Verzeichnis gelöscht: `{data.get('delete_root', '')}`", ephemeral=True)
+        elif event == "complete":
+            await refresh_main_panel()
+            await safe_send(ctx, f"Server **{name}** komplett entfernt.", ephemeral=True)
 
-        delete_root = _delete_root_from_server_path(target_server_path)
-        delete_root_norm = os.path.normcase(os.path.abspath(delete_root))
-        shared_with = None
-        for other_name, other_path in SERVER_PATHS.items():
-            if other_name == name:
-                continue
-            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
-            if other_root == delete_root_norm or other_root.startswith(delete_root_norm + os.sep):
-                shared_with = other_name
-                break
-
-        if os.path.exists(delete_root):
-            if shared_with:
-                await safe_send(
-                    ctx,
-                    f"Ordner bleibt erhalten, da auch `{shared_with}` ihn nutzt: `{delete_root}`",
-                    ephemeral=True,
-                )
-            else:
-                if backup_before_delete:
-                    try:
-                        archive_path = await asyncio.to_thread(_create_directory_backup, delete_root, name)
-                        await safe_send(ctx, f"Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
-                    except Exception as backup_error:
-                        logging.exception("Backup vor remove fehlgeschlagen")
-                        return await safe_send(
-                            ctx,
-                            f"Backup fehlgeschlagen ({backup_error}). Entfernen wurde abgebrochen.",
-                            ephemeral=True,
-                        )
-                await asyncio.to_thread(_chmod_tree_writable, delete_root)
-                await _rmtree_with_retry(delete_root)
-                await safe_send(ctx, f"Server-Verzeichnis gelöscht: `{delete_root}`", ephemeral=True)
-
-        del cfg["server_paths"][name]
-        save_config(cfg)
-        load_server_paths()
-        load_server_configs()
-        clear_server_status(name)
-        await refresh_main_panel()
-        await safe_send(ctx, f"Server **{name}** komplett entfernt.", ephemeral=True)
+    try:
+        ok, message = await dgsm_ops.remove_server(
+            name, backup_before_delete=backup_before_delete, progress=_progress, surface_hooks=False
+        )
+        if ok or message.startswith("Backup failed:"):
+            return
+        if message == "Server not found":
+            return await safe_send(ctx, "Server nicht gefunden!", ephemeral=True)
+        await safe_send(ctx, f"Fehler beim Entfernen: {message}", ephemeral=True)
     except Exception as e:
         await safe_send(ctx, f"Fehler beim Entfernen: {e}", ephemeral=True)
-
 
 @bot.slash_command(name="createbackup", description="Erstellt ein ZIP-Backup eines Servers")
 @commands.has_role("Admin")
@@ -906,55 +508,27 @@ async def create_backup(
 ):
     await safe_defer(ctx, ephemeral=True)
 
-    cfg = load_config()
-    if name not in cfg["server_paths"]:
-        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
-
-    load_server_paths()
-    target_server_path = SERVER_PATHS.get(name)
-    if not target_server_path:
-        entry = cfg["server_paths"].get(name, {})
-        app_id = str(entry.get("app_id", "")).strip()
-        if not app_id:
-            return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
-        instance_id = entry.get("instance_id")
-        if isinstance(instance_id, str) and instance_id.strip():
-            target_server_path = os.path.join(str(server_root(app_id, instance_id=instance_id)), "serverfiles")
-        else:
-            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
-
-    backup_root = _delete_root_from_server_path(target_server_path)
-    if not os.path.exists(backup_root):
-        return await safe_send(ctx, f"❌ Backup-Pfad existiert nicht: `{backup_root}`", ephemeral=True)
-
-    success = False
-    fail_reason = ""
-    status_finalized = False
-    begin_operation(name, "backup")
-    _notify_desktop_ui_refresh(f"{name}: backup running")
-    await refresh_main_panel()
-    try:
-        archive_path = await asyncio.to_thread(_create_directory_backup, backup_root, name)
-        write_action_log("createbackup", name, "success", os.path.basename(archive_path))
-        success = True
-        end_operation_success(name)
-        status_finalized = True
-
-        await refresh_main_panel()
-        await safe_send(ctx, f"✅ Backup erstellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
-    except Exception as e:
-        fail_reason = str(e)
-        write_action_log("createbackup", name, "failed", fail_reason)
-        logging.exception("create_backup fehlgeschlagen")
-        await safe_send(ctx, f"❌ Backup fehlgeschlagen: {e}", ephemeral=True)
-    finally:
-        if not status_finalized:
-            if success:
-                end_operation_success(name)
-            else:
-                end_operation_failed(name, fail_reason or "Backup fehlgeschlagen")
+    async def _progress(event: str, data: dict) -> None:
+        if event == "begin":
+            _notify_desktop_ui_refresh(f"{name}: backup running")
             await refresh_main_panel()
+        elif event == "success":
+            await refresh_main_panel()
+            await safe_send(ctx, f"✅ Backup erstellt: `{data.get('display_path', '')}`", ephemeral=True)
+        elif event == "failed":
+            await safe_send(ctx, f"❌ Backup fehlgeschlagen: {data.get('message', '')}", ephemeral=True)
 
+    ok, message = await dgsm_ops.create_backup(name, progress=_progress, surface_hooks=False)
+    if ok:
+        return
+    if message == "Server not found":
+        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
+    if message == "Server path not found":
+        return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
+    if message.startswith("Backup path missing:"):
+        path = message.split(":", 1)[1].strip()
+        return await safe_send(ctx, f"❌ Backup-Pfad existiert nicht: `{path}`", ephemeral=True)
+    await refresh_main_panel()
 
 @bot.slash_command(name="restorebackup", description="Stellt ein ZIP-Backup eines Servers wieder her")
 @commands.has_role("Admin")
@@ -967,146 +541,38 @@ async def restore_backup(
 ):
     await safe_defer(ctx, ephemeral=True)
 
-    cfg = load_config()
-    if name not in cfg["server_paths"]:
-        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
-
-    archive_path = _resolve_backup_path(backup_file)
-    if not archive_path:
-        return await safe_send(ctx, "❌ Backup-Datei nicht gefunden.", ephemeral=True)
-
-    proc = server_processes.get(name)
-    try:
-        if proc and proc.is_running():
-            return await safe_send(ctx, "❌ Restore nicht möglich: Server läuft.", ephemeral=True)
-    except Exception:
-        pass
-
-    load_server_paths()
-    target_server_path = SERVER_PATHS.get(name)
-    if not target_server_path:
-        entry = cfg["server_paths"].get(name, {})
-        app_id = str(entry.get("app_id", "")).strip()
-        if not app_id:
-            return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
-        instance_id = entry.get("instance_id")
-        if isinstance(instance_id, str) and instance_id.strip():
-            target_server_path = os.path.join(str(server_root(app_id, instance_id=instance_id)), "serverfiles")
-        else:
-            target_server_path = os.path.join(str(server_root(app_id)), "serverfiles")
-
-    restore_root = _delete_root_from_server_path(target_server_path)
-    restore_root_norm = os.path.normcase(os.path.abspath(restore_root))
-    if overwrite:
-        for other_name, other_path in SERVER_PATHS.items():
-            if other_name == name:
-                continue
-            other_root = os.path.normcase(os.path.abspath(_delete_root_from_server_path(other_path)))
-            if other_root == restore_root_norm or other_root.startswith(restore_root_norm + os.sep):
-                return await safe_send(
-                    ctx,
-                    f"❌ overwrite abgelehnt: Ordner wird auch von `{other_name}` genutzt.",
-                    ephemeral=True,
-                )
-
-    if os.path.exists(restore_root) and not overwrite:
-        try:
-            if any(os.scandir(restore_root)):
-                return await safe_send(
-                    ctx,
-                    "❌ Zielordner ist nicht leer. Nutze `overwrite=true`, um zuerst zu löschen.",
-                    ephemeral=True,
-                )
-        except Exception:
-            pass
-
-    success = False
-    fail_reason = ""
-    status_finalized = False
-    begin_operation(name, "restore")
-    _notify_desktop_ui_refresh(f"{name}: restore running")
-    await refresh_main_panel()
-    try:
-        merge_fallback = False
-        skipped_locked_entries: List[str] = []
-        if os.path.exists(restore_root) and overwrite:
-            try:
-                await asyncio.to_thread(_chmod_tree_writable, restore_root)
-                await _rmtree_with_retry(restore_root)
-            except Exception as cleanup_exc:
-                if _is_access_denied_error(cleanup_exc):
-                    merge_fallback = True
-                    logging.warning("Restore cleanup fallback for %s due to locked path: %s", name, cleanup_exc)
-                else:
-                    raise
-        os.makedirs(restore_root, exist_ok=True)
-        last_extract_error = None
-        for attempt in range(2):
-            try:
-                skip_locked = attempt >= 1
-                skipped_items = await asyncio.to_thread(
-                    _extract_zip_archive_safe,
-                    archive_path,
-                    restore_root,
-                    skip_locked,
-                )
-                if skipped_items:
-                    skipped_locked_entries.extend(item for item in skipped_items if item not in skipped_locked_entries)
-                    write_action_log(
-                        "restorebackup",
-                        name,
-                        "warning",
-                        f"skipped locked entries: {', '.join(skipped_items[:6])}",
-                    )
-                last_extract_error = None
-                break
-            except Exception as extract_exc:
-                last_extract_error = extract_exc
-                if _is_access_denied_error(extract_exc):
-                    await asyncio.to_thread(_chmod_tree_writable, restore_root)
-                    await asyncio.sleep(0.45)
-                    continue
-                if attempt >= 1:
-                    raise
-        if last_extract_error is not None:
-            raise last_extract_error
-
-        load_server_paths()
-        load_server_configs()
-        write_action_log("restorebackup", name, "success", os.path.basename(archive_path))
-        success = True
-        end_operation_success(name)
-        status_finalized = True
-
-        await refresh_main_panel()
-        await safe_send(ctx, f"✅ Backup wiederhergestellt: `{_backup_display_path(archive_path)}`", ephemeral=True)
-        if skipped_locked_entries:
-            await safe_send(
-                ctx,
-                f"⚠️ Teilweise Restore: gesperrte Pfade übersprungen ({', '.join(skipped_locked_entries[:4])}).",
-                ephemeral=True,
-            )
-    except Exception as e:
-        fail_reason = str(e)
-        if _is_access_denied_error(e):
-            try:
-                await asyncio.to_thread(_chmod_tree_writable, restore_root)
-            except Exception:
-                pass
-            fail_reason = (
-                f"{fail_reason} (access denied). Bitte Handles schließen und mit overwrite=true erneut versuchen."
-            )
-        write_action_log("restorebackup", name, "failed", fail_reason)
-        logging.exception("restore_backup fehlgeschlagen")
-        await safe_send(ctx, f"❌ Restore fehlgeschlagen: {fail_reason}", ephemeral=True)
-    finally:
-        if not status_finalized:
-            if success:
-                end_operation_success(name)
-            else:
-                end_operation_failed(name, fail_reason or "Restore fehlgeschlagen")
+    async def _progress(event: str, data: dict) -> None:
+        if event == "begin":
+            _notify_desktop_ui_refresh(f"{name}: restore running")
             await refresh_main_panel()
+        elif event == "success":
+            await refresh_main_panel()
+            await safe_send(ctx, f"✅ Backup wiederhergestellt: `{data.get('display_path', '')}`", ephemeral=True)
+            skipped = data.get("skipped", [])
+            if isinstance(skipped, list) and skipped:
+                await safe_send(ctx, f"⚠️ Teilweise Restore: gesperrte Pfade übersprungen ({', '.join(str(x) for x in skipped[:4])}).", ephemeral=True)
+        elif event == "failed":
+            await safe_send(ctx, f"❌ Restore fehlgeschlagen: {data.get('message', '')}", ephemeral=True)
 
+    ok, message = await dgsm_ops.restore_backup(
+        name, backup_file, overwrite=overwrite, progress=_progress, surface_hooks=False
+    )
+    if ok:
+        return
+    if message == "Server not found":
+        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
+    if message == "Backup file not found":
+        return await safe_send(ctx, "❌ Backup-Datei nicht gefunden.", ephemeral=True)
+    if message == "Server is running":
+        return await safe_send(ctx, "❌ Restore nicht möglich: Server läuft.", ephemeral=True)
+    if message == "Server path not found":
+        return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
+    if message.startswith("Overwrite refused: path also used by "):
+        other = message.rsplit(" ", 1)[-1]
+        return await safe_send(ctx, f"❌ overwrite abgelehnt: Ordner wird auch von `{other}` genutzt.", ephemeral=True)
+    if message == "Target directory is not empty":
+        return await safe_send(ctx, "❌ Zielordner ist nicht leer. Nutze `overwrite=true`, um zuerst zu löschen.", ephemeral=True)
+    await refresh_main_panel()
 
 @bot.slash_command(name="showserverconfig", description="Zeigt Konfiguration eines Servers")
 @commands.has_role("Admin")
