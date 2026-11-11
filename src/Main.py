@@ -4,7 +4,7 @@ import logging
 import signal
 from datetime import time
 
-from context import bot, CHANNEL, TOKEN, safe_get_ip
+from context import bot, CHANNEL, TOKEN
 from db import init_db, cleanup_old_logs, write_action_log
 from config_store import get_log_retention_days
 from paths import load_server_paths, load_server_configs
@@ -12,7 +12,7 @@ from server_manager import recover_running_servers, auto_start_servers, monitor_
 from steam_integration import ensure_steamcmd_available
 
 from discord.ext import tasks
-from ui import clean_channel, update_status_message, refresh_status_panel
+from ui import refresh_status_panel
 from server_manager import graceful_stop_all
 from desktop_ui import start_desktop_ui, is_desktop_ui_active, is_desktop_ui_started
 from web_ui import start_web_ui, is_web_ui_started
@@ -23,14 +23,19 @@ _desktop_ui_started = False
 _web_ui_started = False
 
 
+def _ensure_monitor_started() -> None:
+    global _monitor_task
+    if _monitor_task is None or _monitor_task.done():
+        _monitor_task = asyncio.create_task(monitor_servers())
+
+
 @tasks.loop(time=time(hour=6, minute=0))
 async def daily_update():
     ch = bot.get_channel(CHANNEL)
     if not ch:
         return
     try:
-        await clean_channel(ch)
-        await update_status_message(ch, safe_get_ip())
+        await refresh_status_panel(ch)
     except Exception as e:
         logging.error(f"Tägliches Update fehlgeschlagen: {e}")
 
@@ -61,12 +66,10 @@ async def on_ready():
             await auto_start_servers()
         except Exception:
             logging.exception("[BOOT] auto_start_servers fehlgeschlagen")
-        if _monitor_task is None or _monitor_task.done():
-            _monitor_task = asyncio.create_task(monitor_servers())
+        _ensure_monitor_started()
         ch = bot.get_channel(CHANNEL)
         if ch:
-            await clean_channel(ch)
-            await update_status_message(ch, safe_get_ip(), user=None)
+            await refresh_status_panel(ch, user=None)
         if not _desktop_ui_started:
             async def _refresh_discord_from_desktop():
                 channel = bot.get_channel(CHANNEL)
@@ -126,6 +129,8 @@ async def _run_ui_only() -> None:
         await auto_start_servers()
     except Exception:
         logging.exception("[BOOT] auto_start_servers fehlgeschlagen")
+
+    _ensure_monitor_started()
 
     if not _desktop_ui_started:
         started = start_desktop_ui(asyncio.get_running_loop(), refresh_callback=None)

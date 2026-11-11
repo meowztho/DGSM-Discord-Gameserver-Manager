@@ -27,20 +27,29 @@ def _as_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def parse_parameters(value: str) -> List[str]:
+    """Parse grouped arguments without treating Windows path separators as escapes."""
+    lexer = shlex.shlex(str(value or ""), posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return list(lexer)
+
+
+def format_parameters(value: List[str]) -> str:
+    """Editable representation that round-trips every argument, including spaces."""
+    return shlex.join([str(item) for item in value])
+
+
 def _as_parameters(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, list):
-        out: List[str] = []
-        for item in value:
-            txt = _as_str(item)
-            if txt:
-                out.append(txt)
-        return out
+        return [str(item) for item in value if item is not None]
     txt = _as_str(value)
     if not txt:
         return []
-    return [part for part in txt.split() if part]
+    return parse_parameters(txt)
 
 
 def normalize_steam_update_args(value: Any) -> List[str]:

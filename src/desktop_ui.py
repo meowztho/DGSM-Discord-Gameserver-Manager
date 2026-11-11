@@ -2,46 +2,25 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
-import json
 import logging
 import os
-import re
-import shlex
 import sqlite3
-import stat
 import threading
 import time
-import zipfile
 from collections import deque
-from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
-from config_store import DB_PATH, BASE_DIR, PLUGIN_TEMPLATES_DIR, load_config, save_config
+from config_store import DB_PATH, PLUGIN_TEMPLATES_DIR
 from db import write_action_log
-from paths import SERVER_CONFIGS, SERVER_PATHS, load_server_configs, load_server_paths, sanitize_instance_id, server_root
-from runtime_status import (
-    begin_operation,
-    clear_server_status,
-    end_operation_failed,
-    end_operation_success,
-    get_operation_status,
-)
-from server_manager import server_processes, start_server, stop_server, ensure_server_executable_hint
+from paths import SERVER_CONFIGS, SERVER_PATHS, load_server_configs, load_server_paths
+from runtime_status import drain_task, get_operation_status
+from server_manager import server_processes, start_server, stop_server, restart_server
 from steam_integration import run_update
-from security import encrypt_value
 from cli_commands import execute_cli_command
-from template_utils import (
-    build_template_config,
-    read_template_config,
-    template_effective_executable,
-    template_settings_from_config,
-    write_template_files,
-)
+from template_utils import current_os_executable_key, format_parameters
+import server_service
 from rest_bridge import collect_rest_snapshot
 from wgsm_import import format_import_summary, import_wgsm_plugin
-import dgsm_operations as dgsm_ops
-import dgsm_view as view
 
 try:
     import psutil
@@ -90,8 +69,7 @@ _QT_WINDOW = None
 _QT_PUMP_TASK: Optional[asyncio.Task] = None
 
 _ACTION_FEEDBACK: Dict[str, Dict[str, str | int]] = {}
-_LIVE_LOG_LINES = view.LIVE_LOG_LINES
-_STOP_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_LIVE_LOG_LINES: deque[str] = deque(maxlen=1200)
 _APP_STARTED_TS = time.time()
 _PROC_NET_SAMPLE: Dict[int, Tuple[int, int]] = {}
 _PROC_NET_SAMPLE_TS = 0.0
@@ -520,6 +498,23 @@ def _api_player_metric(rows: Optional[List[Dict[str, object]]]) -> str:
             players = sections.get("players")
             if isinstance(players, dict) and isinstance(players.get("players"), list):
                 current = len(players.get("players") or [])
+        # Other REST providers use generic names. Prefer existing Palworld/list
+        # data, then choose one value per server rather than summing aliases.
+        providers = [metrics] + [value for key, value in sections.items() if key != "metrics"]
+        for section in providers:
+            if not isinstance(section, dict):
+                continue
+            values = {str(key).lower(): value for key, value in section.items()}
+            if current is None:
+                for key in ("current_players", "online_players", "player_count", "players"):
+                    current = _number(values.get(key))
+                    if current is not None:
+                        break
+            if maximum is None:
+                for key in ("max_players", "player_limit", "slots"):
+                    maximum = _number(values.get(key))
+                    if maximum is not None:
+                        break
         if current is None and maximum is None:
             continue
         api_count += 1
@@ -538,13 +533,64 @@ def _api_player_metric(rows: Optional[List[Dict[str, object]]]) -> str:
 
 
 def _collect_system_metrics(rows: Optional[List[Dict[str, object]]] = None) -> Dict[str, str]:
-    return view.collect_system_metrics(rows)
+    global _METRICS_CACHE, _METRICS_CACHE_TS, _SERVER_RESOURCE_CACHE
+    running = sum(1 for row in rows or [] if str(row.get("state", "")) == "running")
+    total_servers = len(rows or [])
+    now = time.time()
+    with _METRICS_LOCK:
+        if _METRICS_CACHE and now - _METRICS_CACHE_TS < _METRICS_CACHE_SECONDS:
+            metrics = dict(_METRICS_CACHE)
+            metrics["players"] = _api_player_metric(rows)
+            metrics["servers"] = f"{running} / {total_servers}"
+        else:
+            server_resources = _collect_server_process_metrics(_running_server_roots_by_name(rows))
+            bot_resources = _collect_bot_process_metrics()
+            _SERVER_RESOURCE_CACHE = server_resources
+            server_cpu = sum(float(item.get("cpu", 0.0) or 0.0) for item in server_resources.values())
+            server_rss = sum(int(item.get("rss", 0) or 0) for item in server_resources.values())
+            server_read = sum(float(item.get("read_bps", 0.0) or 0.0) for item in server_resources.values())
+            server_write = sum(float(item.get("write_bps", 0.0) or 0.0) for item in server_resources.values())
+            metrics = {
+                "dgsm": f"{float(bot_resources['cpu']):.1f}% CPU | {_human_bytes(int(bot_resources['rss']))}",
+                "game_servers": f"{server_cpu:.1f}% CPU | {_human_bytes(server_rss)}",
+                "server_io": f"R {_human_bytes(server_read)}/s | W {_human_bytes(server_write)}/s",
+                "players": _api_player_metric(rows),
+                "servers": f"{running} / {total_servers}",
+                "uptime": _format_uptime(now - _APP_STARTED_TS),
+            }
+            _METRICS_CACHE = dict(metrics)
+            _METRICS_CACHE_TS = now
+
+        for row in rows or []:
+            name = str(row.get("name", "") or "")
+            row["resources"] = dict(_SERVER_RESOURCE_CACHE.get(name, {}))
+        return metrics
+
 
 def _bootstrap_log_lines() -> None:
-    view.bootstrap_log_lines()
+    if _LIVE_LOG_LINES:
+        return
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()[-260:]
+        for line in lines:
+            _LIVE_LOG_LINES.append(line.rstrip("\r\n"))
+    except Exception:
+        logging.exception("Desktop UI: could not bootstrap bot.log history")
+
 
 def _install_live_log_handler() -> None:
-    view.install_live_log_handler()
+    global _LOG_HANDLER_INSTALLED
+    if _LOG_HANDLER_INSTALLED:
+        return
+    handler = _UiLogHandler(level=logging.INFO)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+    logging.getLogger().addHandler(handler)
+    _LOG_HANDLER_INSTALLED = True
+
 
 def _hide_console_window() -> None:
     global _CONSOLE_HIDDEN
@@ -610,20 +656,25 @@ def _status_for(name: str) -> Tuple[str, str, str]:
 
 
 def _feedback(name: str, status: str, message: str) -> None:
-    view.feedback(name, status, message)
+    _ACTION_FEEDBACK[name] = {
+        "status": status,
+        "message": _clean(message),
+        "timestamp": int(time.time()),
+    }
+
 
 def _settings_for(name: str) -> Dict[str, str | bool]:
     cfg = SERVER_CONFIGS.get(name, {})
     params = cfg.get("parameters", [])
     if isinstance(params, list):
-        params_text = " ".join(str(x) for x in params)
+        params_text = format_parameters([str(x) for x in params])
     elif isinstance(params, str):
         params_text = params
     else:
         params_text = ""
 
     return {
-        "executable": str(cfg.get("executable", "") or ""),
+        "executable": str(cfg.get(current_os_executable_key()) or cfg.get("executable", "") or ""),
         "parameters": params_text,
         "auto_start": bool(cfg.get("auto_start", False)),
         "auto_update": bool(cfg.get("auto_update", False)),
@@ -643,7 +694,13 @@ async def _refresh_discord_panel() -> None:
 
 
 async def _safe_refresh_discord_panel(timeout: float = 8.0) -> None:
-    await view.safe_refresh(timeout)
+    try:
+        await asyncio.wait_for(_refresh_discord_panel(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logging.warning("Desktop UI: Discord refresh timeout after %.1fs", timeout)
+    except Exception:
+        logging.exception("Desktop UI: Discord refresh failed")
+
 
 def _schedule_discord_refresh() -> None:
     try:
@@ -695,101 +752,201 @@ async def _wait_busy_or_done(name: str, task: asyncio.Task) -> None:
 
 
 async def _collect_servers(reload_config: bool = False) -> List[Dict[str, object]]:
-    return await view.collect_servers(reload_config=reload_config)
+    if reload_config:
+        load_server_paths()
+        load_server_configs()
+
+    out: List[Dict[str, object]] = []
+    rest_tasks: List[Tuple[Dict[str, object], asyncio.Task]] = []
+    names = sorted(SERVER_PATHS.keys(), key=lambda item: str(item).lower())
+    for index, name in enumerate(names, start=1):
+        status_label, state_key, detail = _status_for(name)
+        fb = _ACTION_FEEDBACK.get(name)
+        feedback = f"[{fb.get('status')}] {fb.get('message')}" if fb else ""
+        running = _is_running(name)
+
+        row = {
+            "id": index,
+            "name": name,
+            "status": status_label,
+            "state": state_key,
+            "detail": detail,
+            "running": running,
+            "feedback": feedback,
+            "settings": _settings_for(name),
+            "resources": dict(_SERVER_RESOURCE_CACHE.get(name, {})),
+        }
+        out.append(row)
+        cfg = SERVER_CONFIGS.get(name, {})
+        if isinstance(cfg, dict):
+            rest_tasks.append((row, asyncio.create_task(collect_rest_snapshot(name, cfg, running))))
+
+    if rest_tasks:
+        for row, task in rest_tasks:
+            try:
+                row["rest"] = await task
+            except Exception as exc:
+                row["rest"] = {
+                    "configured": False,
+                    "enabled": False,
+                    "available": False,
+                    "status": "error",
+                    "summary": [],
+                    "sections": {},
+                    "errors": {"bridge": _clean(str(exc), 120)},
+                    "updated_at": None,
+                }
+    return out
+
 
 def _collect_history(limit: int = 90) -> List[Tuple[str, str, str, str, str]]:
-    return view.collect_history(limit)
+    conn = None
+    rows: List[Tuple[str, str, str, str, str]] = []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT timestamp, action, server, status, details FROM logs ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = cur.fetchall()
+    except Exception:
+        logging.exception("Desktop UI: could not load history")
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+    return rows
+
 
 async def _run_action(name: str, action: str) -> Tuple[bool, str]:
-    return await dgsm_ops.run_action(name, action)
+    task = None
+    try:
+        operations = {"start": start_server, "stop": stop_server, "restart": restart_server, "update": run_update}
+        if action not in operations:
+            return False, f"Unknown action: {action}"
+        task = asyncio.create_task(operations[action](name))
+        await _wait_busy_or_done(name, task)
+        await _safe_refresh_discord_panel()
+        result = await asyncio.shield(task)
+        if action == "update":
+            ok, message = result
+            message = message or ("Update completed" if ok else "Update failed")
+        else:
+            ok = bool(result)
+            success_messages = {"start": "Server started", "stop": "Server stopped", "restart": "Server restarted"}
+            message = success_messages[action] if ok else f"{action.title()} failed"
+        _feedback(name, "success" if ok else "failed", message)
+        return ok, message
+    except Exception as exc:
+        logging.exception("Desktop UI action failed: %s %s", action, name)
+        message = str(exc)
+        _feedback(name, "failed", message)
+        return False, message
+    finally:
+        if task is not None and not task.done():
+            try:
+                await drain_task(task)
+            except Exception:
+                logging.exception("Desktop UI action failed during cancellation")
+        _schedule_discord_refresh()
 
 
 async def _run_cli_user_command(command_line: str) -> Tuple[bool, str]:
-    return await view.run_cli_user_command(command_line, source="desktop-ui")
+    result = await execute_cli_command(command_line, source="desktop-ui")
+    if result.refresh:
+        await _safe_refresh_discord_panel()
+    return result.ok, result.message
+
+
+async def _admin_progress(label: str) -> None:
+    await _safe_refresh_discord_panel()
+    notify_external_refresh(label)
+
+
+async def _admin_result(name: str, operation) -> Tuple[bool, str]:
+    result = await operation
+    _feedback(name, "success" if result.ok else "failed", result.message)
+    await _safe_refresh_discord_panel()
+    return result.ok, result.message
+
 
 async def _save_settings(
-    name: str,
-    executable: str,
-    parameters: str,
-    auto_update: bool,
-    auto_restart: bool,
-    restart_after_stop: bool,
-    stop_time: str,
+    name: str, executable: str, parameters: str, auto_update: bool,
+    auto_restart: bool, restart_after_stop: bool, stop_time: str,
     auto_start: bool = False,
 ) -> Tuple[bool, str]:
-    return await dgsm_ops.save_settings(
-        name=name,
-        executable=executable,
-        parameters=parameters,
-        auto_start=auto_start,
-        auto_update=auto_update,
-        auto_restart=auto_restart,
-        restart_after_stop=restart_after_stop,
-        stop_time=stop_time,
-    )
+    return await _admin_result(name, server_service.update_server_settings(
+        name, dict(executable=executable, parameters=parameters, auto_start=auto_start,
+                   auto_update=auto_update, auto_restart=auto_restart,
+                   restart_after_stop=restart_after_stop, stop_time=stop_time),
+        progress=_admin_progress,
+    ))
 
 
-def _list_backup_files() -> List[str]:
-    return view.list_backup_files()
+_list_backup_files = server_service.list_backup_files
+_list_templates = server_service.list_templates
 
-def _list_templates() -> List[str]:
-    return view.list_templates()
 
 async def _create_template_action(
-    template_name: str,
-    app_id: str,
-    executable: str,
-    parameters: str,
-    auto_update: bool,
-    auto_restart: bool,
-    stop_time: str,
-    restart_after_stop: bool,
-    username: str = "",
-    password: str = "",
-    auto_start: bool = False,
+    template_name: str, app_id: str, executable: str, parameters: str,
+    auto_update: bool, auto_restart: bool, stop_time: str, restart_after_stop: bool,
+    username: str = "", password: str = "", auto_start: bool = False,
 ) -> Tuple[bool, str]:
-    return await dgsm_ops.create_template(
-        template_name=template_name,
-        app_id=app_id,
-        executable=executable,
-        parameters=parameters,
-        auto_start=auto_start,
-        auto_update=auto_update,
-        auto_restart=auto_restart,
-        stop_time=stop_time,
-        restart_after_stop=restart_after_stop,
-        username=username,
-        password=password,
-    )
+    return await _admin_result(template_name, server_service.create_template(
+        template_name, app_id, executable, parameters, auto_update=auto_update,
+        auto_restart=auto_restart, stop_time=stop_time, restart_after_stop=restart_after_stop,
+        username=username, password=password, auto_start=auto_start, progress=_admin_progress,
+    ))
 
 
-async def _import_wgsm_plugin_action(source: str, template_name: str = "", *, allow_local: bool = True) -> Tuple[bool, str]:
-    return await dgsm_ops.import_wgsm_plugin_action(
-        source=source, template_name=template_name, allow_local=allow_local
-    )
+async def _import_wgsm_plugin_action(
+    source: str,
+    template_name: str = "",
+    *,
+    allow_local: bool = True,
+) -> Tuple[bool, str]:
+    source_value = str(source or "").strip()
+    if not source_value:
+        return False, "WindowsGSM plugin source required"
+    try:
+        report = await asyncio.to_thread(
+            import_wgsm_plugin,
+            source_value,
+            PLUGIN_TEMPLATES_DIR,
+            template_name=str(template_name or "").strip(),
+            allow_local=allow_local,
+        )
+        message = format_import_summary(report)
+        write_action_log("ui_importwgsm", str(report.get("template_name", "-")), "success", message)
+        _schedule_discord_refresh()
+        return True, message
+    except Exception as exc:
+        logging.exception("WindowsGSM plugin import failed")
+        write_action_log("ui_importwgsm", str(template_name or "-") or "-", "failed", str(exc))
+        return False, str(exc)
 
 
 async def _add_server_action(
-    name: str, template_name: str, instance_id: str = "", start_after_install: bool = True
+    name: str, template_name: str, instance_id: str = "", start_after_install: bool = True,
 ) -> Tuple[bool, str]:
-    return await dgsm_ops.add_server(
-        name=name,
-        template_name=template_name,
-        instance_id=instance_id,
-        start_after_install=start_after_install,
-    )
+    return await _admin_result(name, server_service.add_server(
+        name.strip(), template_name, instance_id, start_after_install, progress=_admin_progress,
+    ))
 
 
 async def _create_backup_action(server_name: str) -> Tuple[bool, str]:
-    return await dgsm_ops.create_backup(server_name)
+    return await _admin_result(server_name, server_service.create_backup(server_name.strip(), progress=_admin_progress))
 
 
 async def _restore_backup_action(name: str, backup_file: str, overwrite: bool = False) -> Tuple[bool, str]:
-    return await dgsm_ops.restore_backup(name, backup_file, overwrite=overwrite)
+    return await _admin_result(name, server_service.restore_backup(name.strip(), backup_file, overwrite, progress=_admin_progress))
 
 
 async def _remove_server_action(name: str, backup_before_delete: bool = True) -> Tuple[bool, str]:
-    return await dgsm_ops.remove_server(name, backup_before_delete=backup_before_delete)
+    return await _admin_result(name, server_service.remove_server(name.strip(), backup_before_delete, progress=_admin_progress))
 
 
 def _build_qss() -> str:
@@ -1709,7 +1866,7 @@ if QApplication is not None:
                     QMessageBox.question(
                         self,
                         "Overwrite target?",
-                        "Overwrite existing files before restore?",
+                        "Replace existing files after the backup has been fully validated?",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                         QMessageBox.StandardButton.No,
                     )
@@ -2092,7 +2249,7 @@ if QApplication is not None:
                 QMessageBox.question(
                     self,
                     "Overwrite target?",
-                    "Overwrite existing files before restore?",
+                    "Replace existing files after the backup has been fully validated?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
@@ -2346,7 +2503,6 @@ def start_desktop_ui(
         _LOOP = loop
         if refresh_callback is not None:
             _REFRESH_CALLBACK = refresh_callback
-            view.configure_refresh_callback(refresh_callback)
 
         _bootstrap_log_lines()
         _install_live_log_handler()

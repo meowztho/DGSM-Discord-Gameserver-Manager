@@ -599,15 +599,28 @@ async def run_custom_install(server_name: str, app_id: str, install_dir: str) ->
                 f"{', '.join(supported_providers())} oder ein '{PLUGIN_ENTRY_FILE}' im Template."
             )
 
+    from runtime_status import drain_task
+
+    worker = asyncio.create_task(asyncio.to_thread(installer, install_dir))
     try:
-        message = await asyncio.wait_for(
-            asyncio.to_thread(installer, install_dir),
-            timeout=_DOWNLOAD_TIMEOUT,
-        )
+        message = await asyncio.wait_for(asyncio.shield(worker), timeout=_DOWNLOAD_TIMEOUT)
         logging.info("[CUSTOM] %s: %s", server_name, message)
         return True, message
     except asyncio.TimeoutError:
+        # Threads cannot be safely cancelled. Keep the lifecycle admission until
+        # this worker exits, even if cleanup exceeds the configured deadline.
+        logging.warning("[CUSTOM] %s: Zeitlimit erreicht; warte auf laufenden Installer", server_name)
+        try:
+            await drain_task(worker)
+        except Exception:
+            logging.exception("[CUSTOM] Installer-Abschluss nach Zeitlimit fehlgeschlagen")
         return False, f"Timeout nach {_DOWNLOAD_TIMEOUT // 60} Minuten beim Download"
+    except asyncio.CancelledError:
+        try:
+            await drain_task(worker)
+        except Exception:
+            logging.exception("[CUSTOM] Installer-Abschluss nach Abbruch fehlgeschlagen")
+        raise
     except Exception as exc:  # noqa: BLE001 - Fehler an UI weiterreichen
         logging.exception("[CUSTOM] Installationsfehler für %s", server_name)
         return False, f"Installationsfehler: {exc}"

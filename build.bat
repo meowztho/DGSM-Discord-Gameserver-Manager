@@ -63,6 +63,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Qt uses Windows' native API sets and ICU. DLLs collected from other tools
+rem on PATH can shadow them and make QtCore fail with missing entry points.
+%PY_CMD% -c "from pathlib import Path; root=Path(r'%ROOT%\dist\%APP_NAME%\_internal').resolve(); [p.unlink() for p in root.glob('api-ms-win-*.dll')]; (root/'icuuc.dll').unlink(missing_ok=True)"
+if errorlevel 1 (
+  echo [ERROR] Runtime DLL cleanup failed.
+  exit /b 1
+)
+
 if exist "%ROOT%\dist\%APP_NAME%\_internal\Logo.png" (
   copy /y "%ROOT%\dist\%APP_NAME%\_internal\Logo.png" "%ROOT%\dist\%APP_NAME%\Logo.png" >nul
 )

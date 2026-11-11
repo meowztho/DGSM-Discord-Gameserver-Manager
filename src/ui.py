@@ -7,7 +7,10 @@ from paths import SERVER_PATHS, load_server_paths, load_server_configs
 from server_manager import server_processes, start_server, stop_server
 from db import write_action_log
 from config_store import get_config_value
-from runtime_status import get_operation_status
+from runtime_status import get_operation_status, drain_task
+
+
+_PANEL_LOCKS = {}
 
 
 # ---------- robust interaction helpers ----------
@@ -77,8 +80,10 @@ async def safe_inter_send(inter: discord.Interaction, content: str, *, ephemeral
 async def clean_channel(channel):
     try:
         await channel.purge(limit=100)
+        return True
     except Exception as e:
         logging.error(f"Kanalbereinigung fehlgeschlagen: {e}")
+        return False
 
 
 async def get_server_status(name: str) -> str:
@@ -127,8 +132,22 @@ async def disable_all_buttons(message):
 
 async def refresh_status_panel(channel, user=None):
     from context import safe_get_ip
-    await clean_channel(channel)
-    await update_status_message(channel, safe_get_ip(), user=user)
+    channel_id = getattr(channel, "id", id(channel))
+    lock = _PANEL_LOCKS.setdefault(channel_id, asyncio.Lock())
+
+    async def replace_panel():
+        if await clean_channel(channel):
+            await update_status_message(channel, safe_get_ip(), user=user)
+
+    # Keep the established purge -> post sequence intact across every producer.
+    # A caller's timeout must not interrupt it after the old panel was removed.
+    async with lock:
+        replacement = asyncio.create_task(replace_panel())
+        try:
+            await asyncio.shield(replacement)
+        except asyncio.CancelledError:
+            await drain_task(replacement)
+            raise
     _notify_desktop_ui_refresh()
 
 

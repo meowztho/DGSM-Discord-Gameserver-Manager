@@ -1,0 +1,5 @@
+DGSM source revision: 628eda1
+Built: 2026-11-11
+Windows: run dist/DGSM/DGSM.exe. Keep the src directory alongside dist.
+Configure src/.env using .env.example. No credentials or game data included.
+For updates, preserve your existing .env, server_config.json, server_pids.json and steam directory.

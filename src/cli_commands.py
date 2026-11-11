@@ -9,7 +9,7 @@ from db import write_action_log
 from paths import SERVER_CONFIGS, SERVER_PATHS, load_server_configs, load_server_paths
 from rest_bridge import describe_rest_actions, execute_rest_action
 from runtime_status import get_operation_status
-from server_manager import server_processes, start_server, stop_server
+from server_manager import server_processes, start_server, stop_server, restart_server
 from steam_integration import run_update
 
 
@@ -240,12 +240,7 @@ async def execute_cli_command(command_line: str, source: str = "cli") -> CliExec
             return result
 
         if cmd == "restart":
-            if _is_running(server):
-                if not await stop_server(server):
-                    result = CliExecutionResult(False, f"{server}: restart failed while stopping", refresh=True)
-                    _log(source, command_line, result, server=server)
-                    return result
-            ok = await start_server(server)
+            ok = await restart_server(server)
             result = CliExecutionResult(ok, f"{server}: {'restarted' if ok else 'restart failed'}", refresh=True)
             _log(source, command_line, result, server=server)
             return result

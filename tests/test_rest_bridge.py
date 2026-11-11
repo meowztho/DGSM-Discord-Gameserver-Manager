@@ -163,6 +163,24 @@ class RestBridgeTests(unittest.IsolatedAsyncioTestCase):
             desktop_ui._collect_system_metrics([])
         server_scan.assert_called_once()
 
+    def test_generic_player_aliases_are_counted_once_per_server(self):
+        for current in ("players", "player_count", "current_players", "online_players"):
+            for maximum in ("max_players", "player_limit", "slots"):
+                rows = [{"rest": {"enabled": True, "available": True, "sections": {
+                    "status": {current.upper(): 3, maximum: 20},
+                    "duplicate": {current: 3, maximum: 20},
+                }}}]
+                self.assertEqual("3/20 | 1 API", desktop_ui._api_player_metric(rows))
+
+    def test_palworld_and_player_list_precede_generic_aliases(self):
+        rows = [{"rest": {"enabled": True, "available": True, "sections": {
+            "metrics": {"currentplayernum": 0, "maxplayernum": 32, "current_players": 99},
+            "players": {"players": [1, 2]},
+        }}}]
+        self.assertEqual("0/32 | 1 API", desktop_ui._api_player_metric(rows))
+        del rows[0]["rest"]["sections"]["metrics"]["currentplayernum"]
+        self.assertEqual("2/32 | 1 API", desktop_ui._api_player_metric(rows))
+
 
 if __name__ == "__main__":
     unittest.main()

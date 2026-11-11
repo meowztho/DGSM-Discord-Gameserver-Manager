@@ -18,7 +18,8 @@ and total-size limits.
 
 ### `steam_ready`
 
-Plugins inheriting from `SteamCMDAgent` with a numeric `AppId` and `StartPath`
+Plugins inheriting from `SteamCMDAgent` with a numeric `AppId` and `StartPath`,
+without custom `Install()` or `Update()` methods,
 are converted into normal DGSM templates. DGSM imports documented defaults and
 safe start arguments. Steam update suffixes are restricted to `-beta` and
 `-betapassword` value pairs.
@@ -26,12 +27,18 @@ safe start arguments. Steam update suffixes are restricted to `-beta` and
 The resulting server continues through DGSM's existing SteamCMD, permissions,
 logging, Discord, process start, and process stop paths.
 
+`steam_ready` describes the static conversion only. It is not proof of runtime
+compatibility with that WindowsGSM plugin; installation and operation still need
+to be verified for each imported game.
+
 ### `review_required`
 
 Plugins using custom `Install()`, `Update()`, or non-Steam delivery cannot be
 translated safely from arbitrary C#. DGSM still creates an inspection template,
 but its generated `install.py` raises a clear error. A developer must replace it
 with a reviewed native DGSM adapter before installation is possible.
+This also applies to plugins that inherit from `SteamCMDAgent` and provide a
+numeric Steam App ID.
 
 ## Generated Files
 

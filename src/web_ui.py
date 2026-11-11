@@ -12,8 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
-import dgsm_operations as dgsm_ops
-import dgsm_view as view
+import desktop_ui as dui
 
 
 _SERVER: Optional[ThreadingHTTPServer] = None
@@ -53,11 +52,11 @@ def _run_async(coro: Awaitable[object], timeout: float = 360.0) -> object:
 
 
 def _state_payload() -> dict:
-    rows = _run_async(view.collect_servers(), timeout=15.0)
+    rows = _run_async(dui._collect_servers(), timeout=15.0)
     servers = rows if isinstance(rows, list) else []
     return {
         "servers": servers,
-        "metrics": view.collect_system_metrics(servers),
+        "metrics": dui._collect_system_metrics(servers),
         "history": [
             {
                 "timestamp": str(item[0]),
@@ -66,11 +65,11 @@ def _state_payload() -> dict:
                 "status": str(item[3]),
                 "details": str(item[4] or ""),
             }
-            for item in view.collect_history(80)
+            for item in dui._collect_history(80)
         ],
-        "logs": list(view.LIVE_LOG_LINES)[-260:],
-        "templates": view.list_templates(),
-        "backups": view.list_backup_files(),
+        "logs": list(dui._LIVE_LOG_LINES)[-260:],
+        "templates": dui._list_templates(),
+        "backups": dui._list_backup_files(),
     }
 
 
@@ -120,22 +119,22 @@ async def _handle_action(data: dict) -> tuple[bool, str]:
     name = str(data.get("name", "") or "").strip()
     action = str(data.get("action", "") or "").strip().lower()
     if action in {"start", "stop", "restart", "update"}:
-        return await dgsm_ops.run_action(name, action)
+        return await dui._run_action(name, action)
     if action == "backup":
-        return await dgsm_ops.create_backup(name)
+        return await dui._create_backup_action(name)
     if action == "restore":
-        return await dgsm_ops.restore_backup(
+        return await dui._restore_backup_action(
             name,
             str(data.get("backup_file", "") or "").strip(),
             overwrite=bool(data.get("overwrite", False)),
         )
     if action == "remove":
-        return await dgsm_ops.remove_server(name, backup_before_delete=bool(data.get("backup_first", True)))
+        return await dui._remove_server_action(name, backup_before_delete=bool(data.get("backup_first", True)))
     return False, f"Unknown action: {action}"
 
 
 async def _handle_settings(data: dict) -> tuple[bool, str]:
-    return await dgsm_ops.save_settings(
+    return await dui._save_settings(
         name=str(data.get("name", "") or "").strip(),
         executable=str(data.get("executable", "") or "").strip(),
         parameters=str(data.get("parameters", "") or "").strip(),
@@ -148,7 +147,7 @@ async def _handle_settings(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_template(data: dict) -> tuple[bool, str]:
-    return await dgsm_ops.create_template(
+    return await dui._create_template_action(
         template_name=str(data.get("template_name", "") or "").strip(),
         app_id=str(data.get("app_id", "") or "").strip(),
         executable=str(data.get("executable", "") or "").strip(),
@@ -164,7 +163,7 @@ async def _handle_template(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_wgsm_import(data: dict) -> tuple[bool, str]:
-    return await dgsm_ops.import_wgsm_plugin_action(
+    return await dui._import_wgsm_plugin_action(
         source=str(data.get("source_url", "") or "").strip(),
         template_name=str(data.get("template_name", "") or "").strip(),
         allow_local=False,
@@ -172,7 +171,7 @@ async def _handle_wgsm_import(data: dict) -> tuple[bool, str]:
 
 
 async def _handle_add_server(data: dict) -> tuple[bool, str]:
-    return await dgsm_ops.add_server(
+    return await dui._add_server_action(
         name=str(data.get("name", "") or "").strip(),
         template_name=str(data.get("template_name", "") or "").strip(),
         instance_id=str(data.get("instance_id", "") or "").strip(),
@@ -206,7 +205,7 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": _state_payload()})
                 return
             if path == "/logo.png":
-                logo = view.find_logo_file()
+                logo = dui._find_logo_file()
                 if logo and os.path.isfile(logo):
                     with open(logo, "rb") as handle:
                         body = handle.read()
@@ -231,8 +230,8 @@ class _WebUiHandler(BaseHTTPRequestHandler):
                 ok, message = _run_async(_handle_settings(data))
             elif path == "/api/cli":
                 command = str(data.get("command", "") or "").strip()
-                view.LIVE_LOG_LINES.append(f"[WEB] > {html.escape(command)[:220]}")
-                ok, message = _run_async(view.run_cli_user_command(command, source="desktop-ui"), timeout=360.0)
+                dui._LIVE_LOG_LINES.append(f"[WEB] > {html.escape(command)[:220]}")
+                ok, message = _run_async(dui._run_cli_user_command(command), timeout=360.0)
             elif path == "/api/template":
                 ok, message = _run_async(_handle_template(data), timeout=360.0)
             elif path == "/api/wgsm-import":
@@ -266,9 +265,9 @@ def start_web_ui(
 
     _LOOP = loop
     if refresh_callback is not None:
-        view.configure_refresh_callback(refresh_callback)
-    view.bootstrap_log_lines()
-    view.install_live_log_handler()
+        dui._REFRESH_CALLBACK = refresh_callback
+    dui._bootstrap_log_lines()
+    dui._install_live_log_handler()
 
     try:
         server = ThreadingHTTPServer((host, port), _WebUiHandler)
@@ -381,7 +380,7 @@ _INDEX_HTML = r"""<!doctype html>
       {const L=$('#logs');const atB=L.scrollHeight-L.scrollTop-L.clientHeight<40;L.textContent=(state.logs||[]).join('\n');if(atB)L.scrollTop=L.scrollHeight;}$('#history').textContent=(state.history||[]).map(h=>`${h.timestamp} | ${h.action}/${h.server} | ${h.status} | ${h.details||'-'}`).join('\n');
       const select=$('#serverForm select[name=template_name]');const current=select.value;select.innerHTML=(state.templates||[]).map(t=>`<option>${esc(t)}</option>`).join('');if(current)select.value=current;
     }
-    document.addEventListener('click',e=>{const tab=e.target.closest('[data-tab]');if(tab){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));$('#tab-'+tab.dataset.tab).classList.add('active');return}const card=e.target.closest('.card');if(card)selected=card.dataset.name;const action=e.target.closest('[data-action]')?.dataset.action||e.target.closest('[data-top]')?.dataset.top;if(action){const name=selected;if(!name)return toast(false,'Select a server first');let payload={name,action};if(action==='remove'){if(!confirm(`Remove server '${name}'?`))return;payload.backup_first=confirm('Create backup before delete?')}if(action==='restore'){const backup=prompt('Backup file:',(state.backups||[])[0]||'');if(!backup)return;payload.backup_file=backup;payload.overwrite=confirm('Overwrite existing files before restore?')}api('/api/action',payload);return}if(e.target.id==='refresh')load();render()});
+    document.addEventListener('click',e=>{const tab=e.target.closest('[data-tab]');if(tab){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));$('#tab-'+tab.dataset.tab).classList.add('active');return}const card=e.target.closest('.card');if(card)selected=card.dataset.name;const action=e.target.closest('[data-action]')?.dataset.action||e.target.closest('[data-top]')?.dataset.top;if(action){const name=selected;if(!name)return toast(false,'Select a server first');let payload={name,action};if(action==='remove'){if(!confirm(`Remove server '${name}'?`))return;payload.backup_first=confirm('Create backup before delete?')}if(action==='restore'){const backup=prompt('Backup file:',(state.backups||[])[0]||'');if(!backup)return;payload.backup_file=backup;payload.overwrite=confirm('Replace existing files after the backup is validated?')}api('/api/action',payload);return}if(e.target.id==='refresh')load();render()});
     $('#settingsForm').addEventListener('input',e=>e.currentTarget.dataset.dirty='1');
     $('#settingsForm').addEventListener('submit',e=>{e.preventDefault();if(!selected)return toast(false,'Select a server first');const f=e.currentTarget,d=Object.fromEntries(new FormData(f).entries());for(const n of ['auto_start','auto_update','auto_restart','restart_after_stop'])d[n]=!!f.elements[n].checked;d.name=selected;delete f.dataset.dirty;api('/api/settings',d)});
     $('#cliForm').addEventListener('submit',e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.currentTarget).entries());api('/api/cli',d)});

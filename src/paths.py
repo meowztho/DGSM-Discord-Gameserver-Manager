@@ -49,6 +49,33 @@ def server_files_for_entry(name: str, info: dict) -> Path:
     return server_files(app_id)
 
 
+def server_root_for_files(files: str | Path) -> Path:
+    """Canonical filesystem scope changed by a server's lifecycle operations."""
+    resolved = Path(os.path.normcase(os.path.realpath(os.fspath(files))))
+    return resolved.parent if resolved.name.lower() == "serverfiles" else resolved
+
+
+def server_root_for_entry(name: str, info: dict) -> Path:
+    """Resolve the same instance root for lifecycle admission and administration."""
+    return server_root_for_files(server_files_for_entry(name, info))
+
+
+def server_operation_roots(name: str, config: Optional[dict] = None) -> set[Path]:
+    """Return configured and already loaded roots that this name can still use.
+
+    Keep the runtime map as well as current configuration: an in-flight operation
+    can still hold its old path while a new entry has not reached that map yet.
+    This is a read-only query; it does not reload or replace either map.
+    """
+    cfg = load_config() if config is None else config
+    entry = cfg.get("server_paths", {}).get(name)
+    roots = {server_root_for_entry(name, entry)} if isinstance(entry, dict) else set()
+    runtime_path = SERVER_PATHS.get(name)
+    if runtime_path:
+        roots.add(server_root_for_files(runtime_path))
+    return roots
+
+
 def load_server_paths():
     """Update in-place so existing imports see changes."""
     cfg = load_config()

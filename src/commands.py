@@ -1,11 +1,7 @@
-﻿import os
+import os
 import json
-import shlex
 import logging
 import asyncio
-import stat
-import zipfile
-from datetime import datetime
 from typing import Optional, List
 
 import discord
@@ -14,46 +10,27 @@ from discord import OptionChoice
 from discord.ext import commands
 
 from context import bot
-from security import encrypt_value
 from config_store import (
-    save_config,
     load_config,
     PLUGIN_TEMPLATES_DIR,
-    BASE_DIR,
     CONFIG_PATH,
     DB_PATH,
 )
-from config_store import get_config_value
 from paths import (
     load_server_paths,
     load_server_configs,
     SERVER_PATHS,
-    server_root,
     sanitize_instance_id,
 )
 from db import write_action_log
 from ui import refresh_status_panel
-from server_manager import start_server, stop_server, server_processes, ensure_server_executable_hint
-from steam_integration import run_update, run_update_with_credentials, get_steamcmd_resolution
+from server_manager import server_processes
+from steam_integration import get_steamcmd_resolution
 from context import CHANNEL, safe_get_ip
 from platform_utils import runtime_platform_label
-from template_utils import (
-    build_template_config,
-    read_template_config,
-    template_effective_executable,
-    template_settings_from_config,
-    write_template_files,
-)
-from runtime_status import (
-    begin_operation,
-    end_operation_success,
-    end_operation_failed,
-    clear_server_status,
-    get_operation_status,
-)
+import server_service
 from cli_commands import execute_cli_command
 from wgsm_import import format_import_summary, import_wgsm_plugin
-import dgsm_operations as dgsm_ops
 
 
 # ---------- helper: robust defer & reply ----------
@@ -163,9 +140,23 @@ def _notify_desktop_ui_refresh(reason: str = "") -> None:
         pass
 
 
+async def _admin_progress(label: str) -> None:
+    _notify_desktop_ui_refresh(label)
+    await refresh_main_panel()
+
+
+async def _admin_reply(ctx, result, success_message: str = "") -> None:
+    try:
+        await refresh_main_panel()
+    except Exception:
+        logging.exception("Administrative final panel refresh failed")
+    message = success_message if result.ok and success_message else result.message
+    await safe_send(ctx, f"{'✅' if result.ok else '❌'} {message}", ephemeral=True)
+
+
 async def template_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionChoice]:
     try:
-        items = [d for d in os.listdir(PLUGIN_TEMPLATES_DIR) if os.path.isdir(os.path.join(PLUGIN_TEMPLATES_DIR, d))]
+        items = server_service.list_templates()
         return [OptionChoice(t) for t in items if ctx.value.lower() in t.lower()][:25]
     except Exception as e:
         logging.error(f"Template Autocomplete error: {e}")
@@ -181,14 +172,12 @@ async def backup_autocomplete(ctx: discord.AutocompleteContext) -> List[OptionCh
     try:
         current = (ctx.value or "").lower()
         server_name = sanitize_instance_id(str(ctx.options.get("name", "") or "")).lower()
-        files = dgsm_ops.list_backup_files()
+        files = server_service.list_backup_files()
         if server_name:
-            matching = [f for f in files if server_name in f.lower()]
-            non_matching = [f for f in files if server_name not in f.lower()]
-            files = matching + non_matching
-        return [OptionChoice(f) for f in files if current in f.lower()][:25]
-    except Exception as e:
-        logging.error(f"Backup Autocomplete error: {e}")
+            files.sort(key=lambda value: server_name not in value.lower())
+        return [OptionChoice(value) for value in files if current in value.lower()][:25]
+    except Exception:
+        logging.exception("Backup autocomplete failed")
         return []
 
 
@@ -323,16 +312,14 @@ async def create_template(
     password: Option(str, "Steam-Passwort", required=False, sensitive=True),
 ):
     await safe_defer(ctx, ephemeral=True)
-    ok, message = await dgsm_ops.create_template(
-        template_name=template_name, app_id=app_id, executable=executable or "",
-        parameters=parameters or "", auto_start=auto_start, auto_update=auto_update,
-        auto_restart=auto_restart, stop_time=stop_time, restart_after_stop=restart_after_stop,
-        username=username or "", password=password or "", surface_hooks=False,
+    result = await server_service.create_template(
+        template_name, app_id, executable or "", parameters or "",
+        auto_update=auto_update, auto_restart=auto_restart, stop_time=stop_time,
+        restart_after_stop=restart_after_stop, username=username or "",
+        password=password or "", auto_start=auto_start, progress=_admin_progress,
     )
-    if ok:
-        await safe_send(ctx, f"✅ Template '{template_name}' erstellt/aktualisiert.", ephemeral=True)
-    else:
-        await safe_send(ctx, f"❌ Fehler: {message}", ephemeral=True)
+    await _admin_reply(ctx, result, f"Template '{template_name}' erstellt/aktualisiert.")
+
 
 @bot.slash_command(name="importwgsm", description="Importiert ein WindowsGSM-Plugin als DGSM-Template")
 @commands.has_role("Admin")
@@ -374,65 +361,19 @@ async def add_server(
     instance_id: Option(str, "Optionale Instanz-ID (z.B. pve-2)", required=False),
 ):
     await safe_defer(ctx, ephemeral=True)
+    await safe_send(ctx, f"Starte Installation von **{name}**…", ephemeral=True)
 
-    async def _progress(event: str, data: dict) -> None:
-        if event == "install_start":
-            await safe_send(ctx, f"Starte Installation von **{name}** (Instanz: `{data.get('instance_id', '')}`)...", ephemeral=True)
-        elif event == "install_busy":
-            await refresh_main_panel()
-        elif event == "install_failed":
-            debug = (
-                f"❌ **Fehler bei Installation von {name}**\n"
-                f"App-ID: `{data.get('app_id', '')}`\n"
-                f"Installationsverzeichnis: `{data.get('server_dir', '')}`\n"
-                f"Verfügbarer Speicher: `{float(data.get('disk_free', 0.0)):.2f} GB`\n"
-                f"Fehlermeldung: ```{data.get('message', '')}```"
-            )
-            await safe_send(ctx, debug, ephemeral=True)
-            await refresh_main_panel()
-        elif event == "install_success_start":
-            await safe_send(ctx, f"✅ Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
-        elif event == "start_failed":
-            await refresh_main_panel()
-            await safe_send(ctx, "❌ Start fehlgeschlagen!", ephemeral=True)
-        elif event == "complete":
-            await refresh_main_panel()
-            await safe_send(
-                ctx,
-                f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{data.get('instance_id', '')}`).",
-                ephemeral=True,
-            )
+    async def progress(label: str) -> None:
+        if label == "start":
+            await safe_send(ctx, f"Installation erfolgreich! ▶️ Starte **{name}**…", ephemeral=True)
+        await _admin_progress(label)
 
-    try:
-        ok, message = await dgsm_ops.add_server(
-            name=name, template_name=template, instance_id=instance_id or "",
-            start_after_install=True, progress=_progress, surface_hooks=False,
-        )
-        if ok:
-            return
-        # Preserve the established Discord-facing validation wording.
-        if message.startswith("Template '") and message.endswith("does not exist"):
-            return await safe_send(ctx, f"❌ Template '{template}' existiert nicht!", ephemeral=True)
-        if message.startswith("Template '") and message.endswith("has no config.json"):
-            return await safe_send(ctx, f"❌ Template '{template}' hat keine config.json!", ephemeral=True)
-        if message == "Template missing app_id":
-            return await safe_send(ctx, "❌ Template unvollständig. Fehlend: app_id", ephemeral=True)
-        if message == f"Server '{name}' already exists":
-            return await safe_send(ctx, f"Server '{name}' existiert bereits.", ephemeral=True)
-        if message.startswith("Instance ID '"):
-            chosen = sanitize_instance_id(instance_id or "")
-            app_id = "?"
-            try:
-                app_id = str(read_template_config(os.path.join(PLUGIN_TEMPLATES_DIR, template)).get("app_id", "?"))
-            except Exception:
-                pass
-            return await safe_send(ctx, f"Instanz-ID '{chosen}' ist für App-ID {app_id} bereits vergeben.", ephemeral=True)
-        if message.startswith("Install failed:") or message == "Installed but start failed":
-            return
-        await safe_send(ctx, f"❌ Kritischer Fehler: {message}", ephemeral=True)
-    except Exception as e:
-        logging.exception("Fehler in add_server")
-        await safe_send(ctx, f"❌ Kritischer Fehler: {e}", ephemeral=True)
+    result = await server_service.add_server(name, template, instance_id or "", progress=progress)
+    await _admin_reply(
+        ctx, result,
+        f"**{name}** aus Template '{template}' installiert und gestartet (Instanz: `{result.instance_id}`).",
+    )
+
 
 @bot.slash_command(name="updateserver", description="Aktualisiert einen Eintrag in Config oder Settings")
 @commands.has_role("Admin")
@@ -445,22 +386,23 @@ async def update_server(
     value: Option(str, "Neuer Wert als Python-Literal", required=False),
 ):
     await safe_defer(ctx, ephemeral=True)
-    cfg = load_config()
-    if server not in cfg["server_paths"]:
-        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
     if not key:
         return await safe_send(ctx, "ℹ️ Kein Eintrag – nichts geändert.", ephemeral=True)
-    if not value:
+    if value is None or value == "":
         return await safe_send(ctx, "❗ Bitte neuen Wert angeben.", ephemeral=True)
     import ast
     try:
-        new_val = ast.literal_eval(value)
+        new_value = ast.literal_eval(value)
     except Exception:
-        new_val = value
-    ok, message = dgsm_ops.update_server_value(server, section, key, new_val, surface_hooks=False)
-    if not ok:
-        return await safe_send(ctx, f"❌ {message}", ephemeral=True)
-    await safe_send(ctx, f"✅ **{server}** {section}.{key} → {value}", ephemeral=True)
+        new_value = value
+    if section == "config":
+        result = await server_service.update_server_config(server, {key: new_value}, progress=_admin_progress)
+    elif section == "settings":
+        result = await server_service.update_server_settings(server, {key: new_value}, progress=_admin_progress)
+    else:
+        return await safe_send(ctx, "❌ Abschnitt muss config oder settings sein.", ephemeral=True)
+    await _admin_reply(ctx, result, f"**{server}** {section}.{key} aktualisiert.")
+
 
 @bot.slash_command(name="removeserver", description="Entfernt einen Server komplett")
 @commands.has_role("Admin")
@@ -471,33 +413,9 @@ async def remove_server(
     backup_before_delete: Option(bool, "Vor dem Löschen ein ZIP-Backup erstellen", default=True),
 ):
     await safe_defer(ctx, ephemeral=True)
+    result = await server_service.remove_server(name, backup_before_delete, progress=_admin_progress)
+    await _admin_reply(ctx, result)
 
-    async def _progress(event: str, data: dict) -> None:
-        if event == "stopped":
-            await safe_send(ctx, f"Server **{name}** gestoppt.", ephemeral=True)
-        elif event == "shared_path":
-            await safe_send(ctx, f"Ordner bleibt erhalten, da auch `{data.get('shared_with', '')}` ihn nutzt: `{data.get('delete_root', '')}`", ephemeral=True)
-        elif event == "backup_created":
-            await safe_send(ctx, f"Backup erstellt: `{data.get('display_path', '')}`", ephemeral=True)
-        elif event == "backup_failed":
-            await safe_send(ctx, f"Backup fehlgeschlagen ({data.get('message', '')}). Entfernen wurde abgebrochen.", ephemeral=True)
-        elif event == "directory_deleted":
-            await safe_send(ctx, f"Server-Verzeichnis gelöscht: `{data.get('delete_root', '')}`", ephemeral=True)
-        elif event == "complete":
-            await refresh_main_panel()
-            await safe_send(ctx, f"Server **{name}** komplett entfernt.", ephemeral=True)
-
-    try:
-        ok, message = await dgsm_ops.remove_server(
-            name, backup_before_delete=backup_before_delete, progress=_progress, surface_hooks=False
-        )
-        if ok or message.startswith("Backup failed:"):
-            return
-        if message == "Server not found":
-            return await safe_send(ctx, "Server nicht gefunden!", ephemeral=True)
-        await safe_send(ctx, f"Fehler beim Entfernen: {message}", ephemeral=True)
-    except Exception as e:
-        await safe_send(ctx, f"Fehler beim Entfernen: {e}", ephemeral=True)
 
 @bot.slash_command(name="createbackup", description="Erstellt ein ZIP-Backup eines Servers")
 @commands.has_role("Admin")
@@ -507,28 +425,9 @@ async def create_backup(
     name: Option(str, "Name des Servers", autocomplete=server_autocomplete),
 ):
     await safe_defer(ctx, ephemeral=True)
+    result = await server_service.create_backup(name, progress=_admin_progress)
+    await _admin_reply(ctx, result, f"Backup erstellt: `{server_service.backup_display(result.path)}`" if result.ok else "")
 
-    async def _progress(event: str, data: dict) -> None:
-        if event == "begin":
-            _notify_desktop_ui_refresh(f"{name}: backup running")
-            await refresh_main_panel()
-        elif event == "success":
-            await refresh_main_panel()
-            await safe_send(ctx, f"✅ Backup erstellt: `{data.get('display_path', '')}`", ephemeral=True)
-        elif event == "failed":
-            await safe_send(ctx, f"❌ Backup fehlgeschlagen: {data.get('message', '')}", ephemeral=True)
-
-    ok, message = await dgsm_ops.create_backup(name, progress=_progress, surface_hooks=False)
-    if ok:
-        return
-    if message == "Server not found":
-        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
-    if message == "Server path not found":
-        return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
-    if message.startswith("Backup path missing:"):
-        path = message.split(":", 1)[1].strip()
-        return await safe_send(ctx, f"❌ Backup-Pfad existiert nicht: `{path}`", ephemeral=True)
-    await refresh_main_panel()
 
 @bot.slash_command(name="restorebackup", description="Stellt ein ZIP-Backup eines Servers wieder her")
 @commands.has_role("Admin")
@@ -537,42 +436,12 @@ async def restore_backup(
     ctx: discord.ApplicationContext,
     name: Option(str, "Name des Servers", autocomplete=server_autocomplete),
     backup_file: Option(str, "Backup-Datei aus /steam/backup", autocomplete=backup_autocomplete),
-    overwrite: Option(bool, "Zielordner vorher löschen", default=False),
+    overwrite: Option(bool, "Zielordner nach vollständiger Backup-Prüfung ersetzen", default=False),
 ):
     await safe_defer(ctx, ephemeral=True)
+    result = await server_service.restore_backup(name, backup_file, overwrite, progress=_admin_progress)
+    await _admin_reply(ctx, result)
 
-    async def _progress(event: str, data: dict) -> None:
-        if event == "begin":
-            _notify_desktop_ui_refresh(f"{name}: restore running")
-            await refresh_main_panel()
-        elif event == "success":
-            await refresh_main_panel()
-            await safe_send(ctx, f"✅ Backup wiederhergestellt: `{data.get('display_path', '')}`", ephemeral=True)
-            skipped = data.get("skipped", [])
-            if isinstance(skipped, list) and skipped:
-                await safe_send(ctx, f"⚠️ Teilweise Restore: gesperrte Pfade übersprungen ({', '.join(str(x) for x in skipped[:4])}).", ephemeral=True)
-        elif event == "failed":
-            await safe_send(ctx, f"❌ Restore fehlgeschlagen: {data.get('message', '')}", ephemeral=True)
-
-    ok, message = await dgsm_ops.restore_backup(
-        name, backup_file, overwrite=overwrite, progress=_progress, surface_hooks=False
-    )
-    if ok:
-        return
-    if message == "Server not found":
-        return await safe_send(ctx, "❌ Server nicht gefunden!", ephemeral=True)
-    if message == "Backup file not found":
-        return await safe_send(ctx, "❌ Backup-Datei nicht gefunden.", ephemeral=True)
-    if message == "Server is running":
-        return await safe_send(ctx, "❌ Restore nicht möglich: Server läuft.", ephemeral=True)
-    if message == "Server path not found":
-        return await safe_send(ctx, "❌ App-ID für den Server fehlt.", ephemeral=True)
-    if message.startswith("Overwrite refused: path also used by "):
-        other = message.rsplit(" ", 1)[-1]
-        return await safe_send(ctx, f"❌ overwrite abgelehnt: Ordner wird auch von `{other}` genutzt.", ephemeral=True)
-    if message == "Target directory is not empty":
-        return await safe_send(ctx, "❌ Zielordner ist nicht leer. Nutze `overwrite=true`, um zuerst zu löschen.", ephemeral=True)
-    await refresh_main_panel()
 
 @bot.slash_command(name="showserverconfig", description="Zeigt Konfiguration eines Servers")
 @commands.has_role("Admin")

@@ -416,6 +416,13 @@ DGSM supports Discord-driven backups and restores.
 - Backup selection supports files from `src/steam/backup` (and legacy `src/backups` if present)
 - Bot responses show short backup paths like `/steam/backup/<file>.zip` (no full absolute path)
 - UI updates automatically after backup/restore and does not stay stuck on "Backup running"
+- Restore validates and fully extracts the archive in a separate staging directory
+  before replacing the target. Invalid archives leave the existing server data intact.
+- With `overwrite=true`, the previous directory is retained as a sibling recovery
+  folder; the result reports its path. Keep enough free disk space for both copies.
+- Restore requires a stopped server. Removal aborts if stopping or the requested
+  pre-removal backup fails. Incompatible operations on the same server are rejected
+  in the backend, including requests from CLI and Web.
 
 ---
 
@@ -637,6 +644,36 @@ DGSM treats **Discord as the primary control plane**:
 
 A local desktop UI exists, but it is optional and uses the same backend logic.
 Discord remains the authoritative control interface by design.
+
+Shared behavior belongs to the backend: `server_manager.py` owns process lifecycle
+and recovery, `steam_integration.py` owns update orchestration, and
+`server_service.py` provides the administrative workflows consumed by Discord,
+Desktop and Web. `runtime_status.py` provides shared task ownership and operation
+status. Nested calls in the same task (such as install → update → start) retain
+ownership; another task cannot start a competing operation. This exclusion also
+covers legacy server names that resolve to the same or overlapping
+storage directories. Independent instance directories can operate separately.
+Long-running workers are drained before ownership is released on cancellation.
+A custom installer that
+exceeds its deadline may therefore keep the server busy until its worker exits.
+
+Discord acknowledgements and panel presentation remain adapter responsibilities.
+Every panel replacement uses the same per-channel, serialized **purge → post**
+sequence, including startup, reconnect, scheduled refreshes and local UI requests.
+Both Discord and UI-only startup compose the same server monitor. PID recovery
+validates the process instance and configured server path; legacy PID-only records
+are accepted only when the process can independently be matched to that server.
+
+Run regression tests without touching an installed DGSM instance:
+
+```powershell
+py -3 tests/run_isolated.py
+```
+
+The runner copies source and tests into a temporary workspace, without runtime
+configuration, credentials or game data. It blocks live network/process actions
+and writes outside that workspace, and retains its test log there. These tests do
+not establish live Discord or WindowsGSM compatibility.
 
 ---
 

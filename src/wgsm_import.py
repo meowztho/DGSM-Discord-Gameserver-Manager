@@ -446,7 +446,13 @@ def inspect_wgsm_source(source: str, source_reference: str = "inline") -> Dict[s
         if item not in deduplicated:
             deduplicated.append(item)
 
-    compatibility = "steam_ready" if is_steam and start_path else "review_required"
+    # Static Steam metadata cannot stand in for custom C# install/update code.
+    custom_lifecycle = bool(re.search(
+        r"\b(?:Install|Update)\s*\([^;{}]*\)\s*(?:\{|=>)", clean
+    ))
+    compatibility = "steam_ready" if is_steam and start_path and not custom_lifecycle else "review_required"
+    if custom_lifecycle:
+        warnings.append("Custom Install()/Update() code requires a reviewed native DGSM install.py adapter")
     if not is_steam:
         warnings.append("Custom/non-Steam Install() and Update() methods require a native DGSM install.py adapter")
 

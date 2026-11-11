@@ -64,6 +64,21 @@ public class CustomGame {
 
 
 class WindowsGsmImportTests(unittest.TestCase):
+    def test_steam_metadata_does_not_bypass_custom_install_review(self):
+        for method in ("Install", "Update"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as templates_dir:
+                source = Path(source_dir) / "CustomSteam.cs"
+                custom = STEAM_PLUGIN.replace(
+                    "public async Task Stop(Process p)",
+                    f"public async Task<Process> {method}() {{ return null; }}\npublic async Task Stop(Process p)",
+                )
+                source.write_text(custom, encoding="utf-8")
+                report = import_wgsm_plugin(str(source), templates_dir)
+                self.assertEqual("review_required", report["compatibility"])
+                template = Path(templates_dir) / report["template_name"]
+                self.assertTrue((template / "install.py").exists())
+                self.assertFalse(json.loads((template / "config.json").read_text())["auto_update"])
+
     def test_inspects_documented_steam_fields_and_dynamic_parameters(self):
         report = inspect_wgsm_source(STEAM_PLUGIN)
         self.assertEqual("steam_ready", report["compatibility"])
